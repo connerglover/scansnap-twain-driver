@@ -124,3 +124,19 @@ Then NAPS2: *New Profile > Driver: TWAIN > Device: ScanSnap iX1300*.
 - **Straight-path (return scan) mode.** Only the U-turn ADF is driven, matching
   the iX1600 profile this generation shares. `install\ScanSnap-iX1300.ini`
   can pin the interlace if a unit disagrees.
+
+## 6. Install state at the end of this session
+
+`C:\Windows\twain_32` still holds only `wiatwain.ds`: no elevated prompt could
+be answered from this shell (`gsudo`, `schtasks /ru SYSTEM` and
+`Start-Process -Verb RunAs` all stalled on the UAC dialog). Everything up to and
+including DSM discovery is proven with the scratch root; writing that directory
+needs one elevated run of `install\install.ps1`.
+
+Also still open, because the scanner was unplugged
+(`USB\VID_04C5&PID_162C\8&2EFE0359&0&7`, `Present = False`):
+
+- a real USB session (endpoint enumeration, INQUIRY/VPD, interlace probe,
+  feed/scan/read, duplex, hardware JPEG);
+- the WinUSB rebind (`install\iX1300-TWAIN.inf`), which needs the device
+  present to take effect.
