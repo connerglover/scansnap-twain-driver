@@ -47,8 +47,8 @@ and row order.
 ## 4. TWAIN, three ways
 
 ```
-build\twaintest.exe  build\ScanSnap-iX1300.ds      # direct load, Mock=1
-build\dsmtest.exe "C:\Program Files\NAPS2\lib\_win32\twaindsm.dll" C:\scanroot
+powershell -File tools\run-dsmtest.ps1     # sets up the scratch root and runs dsmtest
+build\twaintest.exe build\ScanSnap-iX1300.ds   # direct load, Mock=1
 ```
 
 `twaintest` performs exactly the capability writes NAPS2 does in
@@ -71,10 +71,11 @@ ok  DSM ENABLEDS                  ok  DISABLEDS
 ok  SETUPMEMXFER 262144           ok  CLOSEDS
 ```
 
-Because `%WINDIR%\twain_32` needs admin rights, `dsmtest` optionally patches
-the DSM's `GetWindowsDirectoryA` import to point at a scratch root
-(`C:\scanroot`) that holds `twain_32\ScanSnap-iX1300.ds` plus a copy of
-`twaindsm.dll`. The production install writes the real directory.
+Because `%WINDIR%\twain_32` needs admin rights, `dsmtest` patches the DSM's
+`GetWindowsDirectoryA` import to point at a scratch root that holds
+`twain_32\ScanSnap-iX1300.ds` plus a copy of `twaindsm.dll`;
+`tools\run-dsmtest.ps1` creates that tree. The production install writes the
+real directory instead.
 
 ### What NAPS2 itself does
 

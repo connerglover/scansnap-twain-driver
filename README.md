@@ -82,6 +82,7 @@ src/image.c        sample conversion (inversion, de-interleave) + DIB/BMP
 src/ds.c           TWAIN data source
 src/misc.c         config and logging
 tools/selftest.c   protocol test, scripted transport
+tools/run-dsmtest.ps1  run the DSM test without admin rights
 tools/mockscan.c   full session test, synthetic device
 tools/probe.c      hardware probe
 install/           INF, scripts, default ini
