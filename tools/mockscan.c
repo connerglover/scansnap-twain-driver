@@ -95,6 +95,7 @@ int main(int argc, char **argv)
     run_case("gray200", COMP_GRAY, 200, 0, outdir);
     run_case("lineart300", COMP_LINEART, 300, 0, outdir);
     run_case("duplex150", COMP_COLOR, 150, 1, outdir);
+    run_case("color600", COMP_COLOR, 600, 0, outdir);
 
     printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "PASSED",
            failures, failures == 1 ? "" : "s");

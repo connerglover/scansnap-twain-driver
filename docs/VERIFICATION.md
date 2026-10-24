@@ -39,9 +39,10 @@ build\mockscan.exe [outdir]
 ```
 
 A self-answering fake iX1300 walks the whole batch state machine for colour
-300 dpi, gray 200 dpi, line art 300 dpi and colour 150 dpi duplex: geometry,
-row width per bit depth, TWAIN pixel type, page counts (2 / 4) and clean
-termination. With `outdir` it writes BMPs; those were inspected for polarity
+300 dpi, gray 200 dpi, line art 300 dpi, colour 150 dpi duplex and colour
+**600 dpi** (5100x8400, 128 MB per page, which covers the unrestricted-size
+path): geometry, row width per bit depth, TWAIN pixel type, page counts and
+clean termination. With `outdir` it writes BMPs; those were inspected for polarity
 and row order.
 
 ## 4. TWAIN, three ways
@@ -56,7 +57,9 @@ build\twaintest.exe build\ScanSnap-iX1300.ds   # direct load, Mock=1
 FEEDERENABLED, DUPLEXENABLED, AUTOMATICSENSEMEDIUM, PIXELTYPE, BITDEPTH,
 UNITS, XRES/YRES, BRIGHTNESS, CONTRAST), then ENABLEDS, the
 XFERREADY/IMAGEINFO/IMAGEMEMXFER/ENDXFER loop, DISABLEDS, CLOSEDS. 134
-assertions, 0 failures.
+assertions, 0 failures. Native DIB and BMP file transfer are covered too:
+`NATIVEXFER` returns a real `BITMAPINFOHEADER` (biSize 40, 24 bpp, 2550 px
+wide) and `IMAGEFILEXFER` writes a valid BMP.
 
 `dsmtest` does the same through the **actual TWAIN DSM shipped with NAPS2**,
 proving discovery (`MSG_GETFIRST`/`GETNEXT` finds the source), `MSG_OPENDS`,

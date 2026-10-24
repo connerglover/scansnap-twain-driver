@@ -9,7 +9,12 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MAX_PAGE_BYTES (64u * 1024 * 1024)
+/*
+ * One side of one sheet, uncompressed. A4/Letter colour at 600 dpi is
+ * ~101-107 MB, so the ceiling has to clear that; it only exists to stop a
+ * bogus pixel-size response from asking for gigabytes.
+ */
+#define MAX_PAGE_BYTES (320u * 1024 * 1024)
 
 typedef struct Session Session;
 
