@@ -34,7 +34,6 @@ typedef struct {
     TW_BOOL   duplexEnabled;
     TW_BOOL   autoFeed;
     TW_UINT16 xferMech;
-    TW_UINT16 compression;
     int       brightness;    /* -1000..1000, as TWAIN convention */
     int       contrast;
     TW_UINT16 threshold;
@@ -43,18 +42,13 @@ typedef struct {
     Session  *session;
     Page      page;
     int       hasPage;
-    int       pendingCount;   /* pages still to hand out, 0 = last one */
     int       batchDone;
     int       lastError;      /* TWCC_* for DAT_STATUS */
 
     HGLOBAL   nativeHandle;
     char      fileName[MAX_PATH];
-    TW_UINT16 fileFormat;
 
-    TW_UINT16 transferRc;     /* return code of the last transfer call */
-    DWORD     transferBytes;
     DWORD     transferOffset;
-    DWORD     rowBytes;
     LONG      rowsDone;
 } DS;
 
@@ -567,7 +561,6 @@ static void reset_defaults(void)
     g_ds.duplexEnabled = FALSE;
     g_ds.autoFeed = TRUE;
     g_ds.xferMech = TWSX_MEMORY;
-    g_ds.compression = TWCP_NONE;
     g_ds.brightness = 0;
     g_ds.contrast = 0;
     g_ds.threshold = 128;
@@ -626,7 +619,6 @@ static TW_UINT16 start_batch(void)
     session_reset(g_ds.session);
     g_ds.hasPage = 0;
     g_ds.batchDone = 0;
-    g_ds.pendingCount = 0;
     page_free(&g_ds.page);
     memset(&g_ds.page, 0, sizeof g_ds.page);
     {
@@ -647,7 +639,6 @@ static TW_UINT16 start_batch(void)
         if (rc == PROTO_OK) {
             g_ds.page = page;
             g_ds.hasPage = 1;
-            g_ds.pendingCount = 1;
         } else if (rc == PROTO_NODOCS) {
             g_ds.lastError = TWCC_NOMEDIA;
             return TWRC_FAILURE;
@@ -666,23 +657,20 @@ static void next_page(void)
     int back = 0;
     int rc;
 
-    if (g_ds.batchDone) { g_ds.pendingCount = 0; return; }
+    if (g_ds.batchDone) return;
     memset(&page, 0, sizeof page);
     rc = session_next_page(g_ds.session, &page, &back);
     if (rc == PROTO_OK) {
         page_free(&g_ds.page);
         g_ds.page = page;
         g_ds.hasPage = 1;
-        g_ds.pendingCount = 1;
         return;
     }
     if (rc == PROTO_NODOCS) {
         g_ds.batchDone = 1;
-        g_ds.pendingCount = 0;
         return;
     }
     g_ds.batchDone = 1;
-    g_ds.pendingCount = 0;
     g_ds.lastError = twcc(rc);
     LOGF("ds: page fetch failed %d\n", rc);
 }
@@ -707,7 +695,6 @@ static TW_UINT16 native_xfer(TW_MEMREF *out)
     if (!h) return TWRC_FAILURE;
     /* Ownership passes to the DSM/application, which frees it. */
     *out = (TW_MEMREF)h;
-    g_ds.pendingCount = 0;
     return TWRC_XFERDONE;
 }
 
@@ -729,10 +716,7 @@ static TW_UINT16 memory_xfer(pTW_IMAGEMEMXFER x)
     x->Columns = (TW_UINT32)p->width;
     x->XOffset = 0;
 
-    if (g_ds.rowsDone == 0) {
-        g_ds.rowBytes = (DWORD)p->rowBytes;
-        g_ds.transferOffset = 0;
-    }
+    if (g_ds.rowsDone == 0) g_ds.transferOffset = 0;
 
     remaining = (DWORD)((size_t)p->rowBytes * (size_t)p->height) - g_ds.transferOffset;
     want = x->Memory.Length;
@@ -747,10 +731,8 @@ static TW_UINT16 memory_xfer(pTW_IMAGEMEMXFER x)
     x->YOffset = (TW_UINT32)(g_ds.transferOffset / p->rowBytes);
     g_ds.transferOffset += want;
     g_ds.rowsDone += (LONG)x->Rows;
-    g_ds.transferBytes = want;
 
     if (g_ds.transferOffset >= (DWORD)((size_t)p->rowBytes * (size_t)p->height)) {
-        g_ds.pendingCount = 0;
         return TWRC_XFERDONE;
     }
     return TWRC_SUCCESS;
@@ -761,7 +743,6 @@ static TW_UINT16 file_xfer(void)
     if (!g_ds.hasPage) return TWRC_FAILURE;
     if (!g_ds.fileName[0]) return TWRC_FAILURE;
     if (!page_save(&g_ds.page, g_ds.fileName, TWFF_BMP)) return TWRC_FAILURE;
-    g_ds.pendingCount = 0;
     return TWRC_XFERDONE;
 }
 
@@ -864,14 +845,6 @@ static TW_UINT16 ds_imageinfo(pTW_IMAGEINFO info)
     return TWRC_SUCCESS;
 }
 
-static TW_UINT16 ds_imagelayout(TW_UINT16 msg)
-{
-    /* The DS always scans the full window the app asks for; DAT_IMAGELAYOUT
-     * is stored by the app path below. Nothing to do for GET. */
-    if (msg == MSG_GET || msg == MSG_SET) return TWRC_SUCCESS;
-    return TWRC_FAILURE;
-}
-
 static TW_UINT16 ds_event(pTW_EVENT evt)
 {
     MSG *m;
@@ -891,8 +864,6 @@ static TW_UINT16 ds_enable(TW_USERINTERFACE *ui)
 {
     if (!ui) return TWRC_FAILURE;
     g_ds.parent = (HWND)ui->hParent;
-    g_ds.showUI = ui->ShowUI;
-    g_ds.modal = ui->ModalUI;
     g_ds.enabled = 1;
     g_ds.transferOffset = 0;
     g_ds.rowsDone = 0;
@@ -1023,7 +994,6 @@ TW_UINT16 FAR PASCAL DS_Entry(pTW_IDENTITY origin, TW_UINT32 dg, TW_UINT16 dat,
             if (!f) return TWRC_FAILURE;
             if (msg == MSG_SET) {
                 strcpy_s(g_ds.fileName, sizeof g_ds.fileName, f->FileName);
-                g_ds.fileFormat = f->Format;
                 return TWRC_SUCCESS;
             }
             if (msg == MSG_GET) {
