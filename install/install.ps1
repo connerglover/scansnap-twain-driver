@@ -51,15 +51,19 @@ Write-Host 'Registered DSM fallback key.'
 
 if (-not $SkipUsb) {
     $inf = Join-Path $PSScriptRoot 'iX1300-TWAIN.inf'
+    $cat = Join-Path $PSScriptRoot 'ScanSnap-iX1300.cat'
+    if (-not (Test-Path $cat)) {
+        Write-Host 'No signed catalog yet; creating one (self-signed, this machine only).'
+        & (Join-Path $PSScriptRoot 'make-catalog.ps1') | Out-Host
+    }
     Write-Host "Binding the scanner to WinUSB ($inf)"
-    # Present the INF as a driver package and install it for the device.
     pnputil /add-driver $inf /install
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning "pnputil returned $LASTEXITCODE. If the device is not plugged in, plug it in and run: pnputil /add-driver `"$inf`" /install"
+        Write-Warning "pnputil returned $LASTEXITCODE. If the scanner is unplugged, plug it in and rerun: pnputil /add-driver `"$inf`" /install"
     }
-    $hwid = 'USB\VID_04C5&PID_162C'
-    Write-Host "Hardware ID: $hwid"
-    Write-Host 'Verify with: Get-PnpDevice -Class USBDevice | Where-Object InstanceId -like "*VID_04C5*"'
+    Write-Host ''
+    Write-Host 'Verify with:  Get-PnpDevice | Where-Object InstanceId -like "*VID_04C5&PID_162C*"'
+    Write-Host 'Expected:     Class "USBDevice", Status "OK"  (not "Image")'
 }
 
 Write-Host ''

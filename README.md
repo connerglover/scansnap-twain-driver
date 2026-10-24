@@ -94,3 +94,19 @@ docs/VERIFICATION.md  what was proven, and how
 MIT (see `LICENSE`). Protocol facts are drawn from sane-backends'
 `fujitsu` backend (GPL-2.0-or-later) and holgerkrupp/Scan (MIT); no code was
 copied, only command layouts and constants.
+
+## Notes on the USB binding
+
+`install\install.ps1 -SkipUsb` keeps whatever binding the machine already has.
+Two cases work:
+
+| Binding | Transport used | Needs |
+|---|---|---|
+| WinUSB (`install\iX1300-TWAIN.inf`) | `WinUsb_*` | the INF installed once |
+| `usbscan.sys` (ScanSnap Home's INF) | `\\.\UsbscanN` + `ReadFile`/`WriteFile` | nothing extra |
+
+The data source tries the WinUSB interface GUID first and falls back to
+`\\.\Usbscan0..7`, matching the vendor ID/product ID via
+`IOCTL_GET_DEVICE_DESCRIPTOR`, so it can be tested on a machine that still has
+ScanSnap Home installed without touching the driver binding. In that case stop
+`PfuSsMon.exe` first: it holds the device open.

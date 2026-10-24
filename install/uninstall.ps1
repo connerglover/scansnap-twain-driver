@@ -25,8 +25,14 @@ if (Test-Path $key) {
     Remove-ItemProperty -Path $key -Name 'ScanSnap-iX1300' -ErrorAction SilentlyContinue
 }
 
+# Drop our driver package from the store (ignored when never installed).
+$infName = 'iX1300-TWAIN.inf'
+$published = (& pnputil /enum-drivers) 2>$null | Out-String
+if ($published -match [regex]::Escape($infName)) {
+    pnputil /delete-driver $infName /uninstall /force
+}
+
 if ($RestorePfu) {
-    $inf = Join-Path $PSScriptRoot 'iX1300-TWAIN.inf'
     $oem = Get-ChildItem "$env:WINDIR\INF\oem*.inf" -ErrorAction SilentlyContinue |
         Where-Object { (Get-Content $_.FullName -Raw) -match 'VID_04C5&PID_162C' } |
         Select-Object -First 1
