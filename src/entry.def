@@ -1,0 +1,3 @@
+LIBRARY	ScanSnap-iX1300.ds
+EXPORTS
+	DS_Entry	@1

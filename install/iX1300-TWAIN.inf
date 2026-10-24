@@ -1,0 +1,44 @@
+; WinUSB binding for the ScanSnap iX1300, so the standalone TWAIN data source
+; (ScanSnap-iX1300.ds) can talk to the scanner with no ScanSnap software
+; installed.
+;
+; Replaces the PFU WIA/STI binding (oem21.inf -> usbscan.sys + SSiX13-x64.dll).
+; The vendor 04c5:162c interface is vendor-specific (FF/FF/FF) with a single
+; bulk pair, which is all WinUSB needs.
+;
+; Install with install\install.ps1 (admin). Remove with install\uninstall.ps1.
+
+[Version]
+Signature   = "$Windows NT$"
+Class       = USBDevice
+ClassGuid   = {88BAE032-5A81-49f0-BC3D-A4FF138216D6}
+Provider    = %ProviderName%
+CatalogFile = ScanSnap-iX1300.cat
+DriverVer   = 10/24/2026,1.0.0.0
+PnpLockdown = 1
+
+[Manufacturer]
+%ProviderName% = ScanSnap, NTamd64
+
+[ScanSnap.NTamd64]
+%DeviceName% = USB_Install, USB\VID_04C5&PID_162C
+
+[USB_Install]
+Include = winusb.inf
+Needs   = WINUSB.NT
+
+[USB_Install.Services]
+Include = winusb.inf
+Needs   = WINUSB.NT.Services
+
+; Device interface class the data source enumerates
+; (GUID_DEVINTERFACE_SCANSNAP_IX1300 in src/usb.c).
+[USB_Install.HW]
+AddReg = Dev_AddReg
+
+[Dev_AddReg]
+HKR,,DeviceInterfaceGUIDs,0x10000,"{6E7C3D2A-5C41-4A0E-9C2B-1D2F5A8B7C10}"
+
+[Strings]
+ProviderName = "Conner"
+DeviceName   = "ScanSnap iX1300 (WinUSB, standalone TWAIN)"
