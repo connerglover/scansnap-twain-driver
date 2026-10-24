@@ -338,8 +338,8 @@ static void build_window(BYTE *d, const ScanJob *j, int interlace, int duplex,
     d[0x00] = (BYTE)windowId;
     putn(d + 0x02, j->resX, 2);
     putn(d + 0x04, j->resY, 2);
-    putn(d + 0x06, 0, 4);                       /* ULX */
-    putn(d + 0x0A, 0, 4);                       /* ULY */
+    putn(d + 0x06, (unsigned)j->ulxUnits, 4);   /* ULX */
+    putn(d + 0x0A, (unsigned)j->ulyUnits, 4);   /* ULY */
     putn(d + 0x0E, (unsigned)j->widthUnits, 4);
     putn(d + 0x12, (unsigned)j->lengthUnits, 4);
     d[0x16] = (BYTE)(j->brightness + 128);     /* 0 when neutral */

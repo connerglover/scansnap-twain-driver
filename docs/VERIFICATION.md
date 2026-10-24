@@ -76,6 +76,27 @@ the DSM's `GetWindowsDirectoryA` import to point at a scratch root
 (`C:\scanroot`) that holds `twain_32\ScanSnap-iX1300.ds` plus a copy of
 `twaindsm.dll`. The production install writes the real directory.
 
+### What NAPS2 itself does
+
+`NAPS2.Console.exe --listdevices --driver twain` with `TWAINDSM_LOG` set shows
+the exact path NAPS2 takes:
+
+```
+Application: "NAPS2.Worker"   "NAPS2 - Not Another PDF Scanner" 8.5  TWAIN 2.3
+TWAIN 32 Source Manager (Image Acquisition Interface) version 2, 3, 0, 0
+DG_CONTROL/DAT_PARENT/MSG_OPENDSM
+  We're deliberately skipping this file: C:\WINDOWS\twain_32\wiatwain.ds
+DG_CONTROL/DAT_ENTRYPOINT/MSG_GET   -> TWRC_SUCCESS      (DF_APP2 app)
+DG_CONTROL/DAT_IDENTITY/MSG_GETFIRST -> TWRC_ENDOFLIST    (no DS installed yet)
+```
+
+That is the confirmation that matters: NAPS2 loads the **32-bit** DSM, opens it
+with a window handle, requests the 2.x entry point, and enumerates
+`%WINDIR%\twain_32`. `dsmtest` exercises those same triplets against the same
+`twaindsm.dll` with the DS present, and they succeed. Installing the DS into the
+real directory is the only remaining difference, and it is the step that needs
+administrator rights.
+
 ## 5. Hardware (still to run)
 
 ```

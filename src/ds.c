@@ -45,7 +45,6 @@ typedef struct {
     int       batchDone;
     int       lastError;      /* TWCC_* for DAT_STATUS */
 
-    HGLOBAL   nativeHandle;
     char      fileName[MAX_PATH];
 
     DWORD     transferOffset;
@@ -211,6 +210,13 @@ static int resolution_list(int *out, int max)
     return n;
 }
 
+static int default_resolution(const int *res, int n)
+{
+    int i;
+    for (i = 0; i < n; i++) if (res[i] == 300) return 300;
+    return res[n / 2];
+}
+
 /* A step that never skips past MaxValue (NTwain enumerates the range). */
 static int resolution_step(const int *res, int n)
 {
@@ -308,7 +314,7 @@ static TW_UINT16 cap_get(TW_CAPABILITY *cap)
                     lo = f32(res[0]);
                     hi = f32(res[n - 1]);
                     st = f32((double)resolution_step(res, n));
-                    dv = f32(res[n > 2 ? 2 : 0]);
+                    dv = f32(default_resolution(res, n));
                     cv = f32(res_of(def->id == ICAP_XRESOLUTION ? g_ds.xres : g_ds.yres));
                     r->ItemType = TWTY_FIX32;
                     memcpy(&r->MinValue, &lo, 4);
@@ -350,7 +356,7 @@ fill:
         u16 = (TW_UINT16)0xFFFF;
         break;
     case CAP_FEEDERENABLED:
-        u16 = (g_ds.feederEnabled = TRUE);
+        u16 = g_ds.feederEnabled;
         break;
     case CAP_FEEDERLOADED:
         u16 = (TW_BOOL)(g_ds.session ? (session_hopper_has_paper(g_ds.session) ? TRUE : FALSE) : FALSE);
@@ -471,7 +477,11 @@ static TW_UINT16 cap_set(TW_CAPABILITY *cap)
 
     switch (cap->Cap) {
     case CAP_FEEDERENABLED:
-        /* feeder-only device: refuse to turn it off */
+        /*
+         * Feeder-only: refuse FALSE, which is how NAPS2 detects a device with
+         * no flatbed (it sets FALSE for PaperSource.Auto and then reads back
+         * the current value).
+         */
         if (!v) return TWRC_FAILURE;
         g_ds.feederEnabled = TRUE;
         return TWRC_SUCCESS;
@@ -580,8 +590,15 @@ static ScanJob current_job(void)
     j.feedFromBack = 0;
 
     physical_size(&wIn, &hIn);
-    if (unf32(g_ds.right) > unf32(g_ds.left)) wIn = unf32(g_ds.right) - unf32(g_ds.left);
-    if (unf32(g_ds.bottom) > unf32(g_ds.top)) hIn = unf32(g_ds.bottom) - unf32(g_ds.top);
+    {
+        double left = unf32(g_ds.left), top = unf32(g_ds.top);
+        if (unf32(g_ds.right) > left) wIn = unf32(g_ds.right) - left;
+        if (unf32(g_ds.bottom) > top) hIn = unf32(g_ds.bottom) - top;
+        if (left < 0) left = 0;
+        if (top < 0) top = 0;
+        j.ulxUnits = (LONG)(left * 1200.0 + 0.5);
+        j.ulyUnits = (LONG)(top * 1200.0 + 0.5);
+    }
 
     j.pixelsWide = (LONG)(wIn * resX + 0.5);
     if (j.composition == COMP_LINEART) j.pixelsWide -= j.pixelsWide % 8;
@@ -677,20 +694,10 @@ static void next_page(void)
 
 /* ---------------------------------------------------------- transfers */
 
-static void free_native(void)
-{
-    if (g_ds.nativeHandle) {
-        GlobalUnlock(g_ds.nativeHandle);
-        GlobalFree(g_ds.nativeHandle);
-        g_ds.nativeHandle = 0;
-    }
-}
-
 static TW_UINT16 native_xfer(TW_MEMREF *out)
 {
     HGLOBAL h;
     if (!g_ds.hasPage) return TWRC_FAILURE;
-    free_native();
     h = page_to_hdib(&g_ds.page);
     if (!h) return TWRC_FAILURE;
     /* Ownership passes to the DSM/application, which frees it. */
@@ -852,6 +859,17 @@ static TW_UINT16 ds_event(pTW_EVENT evt)
     m = (MSG *)evt->pEvent;
     evt->TWMessage = MSG_NULL;
     if (!m) return TWRC_NOTDSEVENT;
+
+    /*
+     * A DS posts MSG_XFERREADY once per page, and apps that drive pages from
+     * TW_PENDINGXFERS.Count (NTwain does) never consume the later ones. When
+     * such a message surfaces after the last page the DS is already disabled;
+     * reporting it then makes the app start a transfer against a source with
+     * no image. Report it only while a page is actually waiting.
+     */
+    if (m->message == MSG_XFERREADY && (!g_ds.enabled || !g_ds.hasPage))
+        return TWRC_NOTDSEVENT;
+
     if (m->message == MSG_XFERREADY || m->message == MSG_CLOSEDSREQ ||
         m->message == MSG_CLOSEDSOK || m->message == MSG_DEVICEEVENT) {
         evt->TWMessage = (TW_UINT16)m->message;
@@ -884,7 +902,6 @@ static TW_UINT16 ds_disable(void)
     g_ds.enabled = 0;
     g_ds.hasPage = 0;
     page_free(&g_ds.page);
-    free_native();
     return TWRC_SUCCESS;
 }
 
@@ -1086,7 +1103,6 @@ BOOL APIENTRY DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
             g_ds.session = NULL;
         }
         page_free(&g_ds.page);
-        free_native();
-    }
+        }
     return TRUE;
 }

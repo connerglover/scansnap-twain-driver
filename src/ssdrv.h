@@ -100,6 +100,8 @@ typedef struct {
     int  composition;      /* COMP_* */
     int  duplex;
     int  feedFromBack;     /* scan the card/back window only */
+    LONG ulxUnits;         /* 1/1200 inch, window origin */
+    LONG ulyUnits;
     LONG widthUnits;       /* 1/1200 inch */
     LONG lengthUnits;
     LONG paperWidthUnits;

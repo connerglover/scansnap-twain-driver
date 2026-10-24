@@ -128,6 +128,22 @@ static int run_scan(const char *outdir, int pixelType, int duplex, const char *t
     {
         TW_UINT32 v = 0;
         TW_UINT16 t = 0;
+        TW_IMAGELAYOUT layout;
+        memset(&layout, 0, sizeof layout);
+        rc = call(DG_IMAGE, DAT_IMAGELAYOUT, MSG_GET, &layout);
+        CHECK(rc == TWRC_SUCCESS, "IMAGELAYOUT GET");
+        memset(&layout.Frame, 0, sizeof layout.Frame);
+        layout.Frame.Right.Whole = 8;          /* 8.5 in as FIX32 */
+        layout.Frame.Right.Frac = 0x8000;
+        layout.Frame.Bottom.Whole = 11;
+        rc = call(DG_IMAGE, DAT_IMAGELAYOUT, MSG_SET, &layout);
+        CHECK(rc == TWRC_SUCCESS, "IMAGELAYOUT SET");
+        memset(&layout, 0, sizeof layout);
+        rc = call(DG_IMAGE, DAT_IMAGELAYOUT, MSG_GET, &layout);
+        CHECK(layout.Frame.Right.Whole == 8 && layout.Frame.Right.Frac == 0x8000 &&
+              layout.Frame.Bottom.Whole == 11,
+              "layout round-trip %d.%04x x %d", layout.Frame.Right.Whole,
+              layout.Frame.Right.Frac, layout.Frame.Bottom.Whole);
         rc = get_one(CAP_DUPLEX, &v, &t);
         CHECK(rc == TWRC_SUCCESS, "CAP_DUPLEX readable (0x%x)", v);
         rc = get_one(ICAP_PHYSICALWIDTH, &v, &t);
