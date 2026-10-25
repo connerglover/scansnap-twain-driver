@@ -75,11 +75,22 @@ ok  DSM ENABLEDS                  ok  DISABLEDS
 ok  SETUPMEMXFER 262144           ok  CLOSEDS
 ```
 
-Because `%WINDIR%\twain_32` needs admin rights, `dsmtest` patches the DSM's
-`GetWindowsDirectoryA` import to point at a scratch root that holds
-`twain_32\ScanSnap-iX1300.ds` plus a copy of `twaindsm.dll`;
-`tools\run-dsmtest.ps1` creates that tree. The production install writes the
-real directory instead.
+`dsmtest` also runs against the **real** `C:\Windows\twain_32`, which now holds
+the data source, with no scratch root and no import patching:
+
+```
+dsmtest "C:\Program Files\NAPS2\lib\_win32\twaindsm.dll" "C:\Windows"
+ok  DSM OPENDSM rc=0
+ok  DSM discovered the iX1300 data source      <- from the real directory
+ok  DSM OPENDS rc=0
+ok  DSM ICAP_XFERMECH = MEMORY rc=0
+```
+
+`ENABLEDS` then fails *in that run only*, because the installed
+`ScanSnapTWAIN.ini` has `Mock=0` and the scanner is wedged (section 5); the
+scratch-root run, which sets `Mock=1`, passes all 14 assertions. So discovery,
+`OPENDS` and capability routing are proven in the real location, and transfer is
+proven synthetically.
 
 ### What NAPS2 itself does
 
@@ -97,10 +108,8 @@ DG_CONTROL/DAT_IDENTITY/MSG_GETFIRST -> TWRC_ENDOFLIST    (no DS installed yet)
 
 That is the confirmation that matters: NAPS2 loads the **32-bit** DSM, opens it
 with a window handle, requests the 2.x entry point, and enumerates
-`%WINDIR%\twain_32`. `dsmtest` exercises those same triplets against the same
-`twaindsm.dll` with the DS present, and they succeed. Installing the DS into the
-real directory is the only remaining difference, and it is the step that needs
-administrator rights.
+`%WINDIR%\twain_32`. That enumeration is the one thing that used to be empty;
+it is now not, and `msg_getfirst` returns the source above.
 
 ## 5. Hardware
 
@@ -190,9 +199,12 @@ logging in code, because it is the hardware tool.
 
 ## 6. Install state
 
-`C:\Windows\twain_32` now holds `ScanSnap-iX1300.ds` and `ScanSnapTWAIN.ini`
-next to the in-box `wiatwain.ds`, so the data source is installed where the
-32-bit DSM looks.
+`C:\Windows\twain_32` holds `ScanSnap-iX1300.ds` and `ScanSnapTWAIN.ini` next
+to the in-box `wiatwain.ds`, so the data source is installed where the 32-bit
+DSM looks. **The installed copy predates the fixes above**: it is the 17:57
+build, and `C:\Windows\twain_32` is not writable from a non-elevated shell
+(`cp` reports "Permission denied"). Re-run `install\install.ps1` elevated, or
+copy `build\ScanSnap-iX1300.ds` over it, before judging the driver from NAPS2.
 
 Still open, and both are one elevated command away:
 
