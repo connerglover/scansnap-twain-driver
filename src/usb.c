@@ -49,6 +49,8 @@ static int  g_mockSheet, g_mockImageLeft, g_mockLines;
 static LONG g_mockPixelsWide;
 static BYTE g_mockLastOp;
 static BYTE g_mockDesired;   /* composition of the pending image */
+static int  g_mockSensePending;   /* next REQUEST SENSE reports a condition */
+static BYTE g_mockSenseKey, g_mockSenseAsc, g_mockSenseAscq;
 
 static Transport *mock_open(int synthetic)
 {
@@ -63,6 +65,13 @@ static Transport *mock_open(int synthetic)
         g_mockDesired = 5;
         g_mockPixelsWide = 2550;
         g_mockLines = 3300;
+        g_mockSensePending = 0;
+        /*
+         * A new synthetic device must start with an empty response queue.
+         * Anything left from a previous session would be read as this
+         * session's first answer (`mockscan` runs five batches in a row).
+         */
+        mock_reset();
     }
     strcpy_s(t->path, sizeof t->path, synthetic ? "mock://ix1300/synthetic" : "mock://ix1300/scripted");
     return t;
@@ -593,6 +602,12 @@ static void mock_handle_command(const BYTE *env)
         BYTE sense[0x12];
         memset(sense, 0, sizeof sense);
         sense[0] = 0x70;
+        if (g_mockSensePending) {
+            sense[2] = g_mockSenseKey;
+            sense[12] = g_mockSenseAsc;
+            sense[13] = g_mockSenseAscq;
+            g_mockSensePending = 0;
+        }
         mock_push(sense, sizeof sense);
         mock_queue_status(0);
     } break;
@@ -616,14 +631,16 @@ static void mock_handle_command(const BYTE *env)
     case 0x31: {  /* OBJECT POSITION */
         if (cdb[1] == 0x01) {
             if (g_mockSheet >= 2) {
-                BYTE sense[0x12];
+                /*
+                 * CHECK CONDITION only. do_cmd fetches sense with its own
+                 * REQUEST SENSE, so pushing sense data here would leave it
+                 * queued and desync every later command.
+                 */
                 mock_queue_status(1);
-                memset(sense, 0, sizeof sense);
-                sense[0] = 0x70;
-                sense[2] = 0x03;
-                sense[12] = 0x80; sense[13] = 0x03;   /* no documents */
-                mock_push(sense, sizeof sense);
-                mock_queue_status(0);
+                g_mockSensePending = 1;
+                g_mockSenseKey = 0x03;
+                g_mockSenseAsc = 0x80;
+                g_mockSenseAscq = 0x03;      /* hopper empty / no documents */
                 break;
             }
             g_mockSheet++;

@@ -445,6 +445,23 @@ static int scanner_control(Proto *p, int function)
     return do_cmd(&l, cdb, 10, NULL, 0, NULL, NULL, 30000);
 }
 
+/* Public wrappers: the data source uses these to clear a latched condition. */
+int proto_scanner_control(Proto *p, int function)
+{
+    return scanner_control(p, function);
+}
+
+int proto_object_position(Proto *p, int function)
+{
+    Link l;
+    BYTE cdb[10];
+    memset(&l, 0, sizeof l); l.t = p->t;
+    memset(cdb, 0, sizeof cdb);
+    cdb[0] = 0x31;
+    cdb[1] = (BYTE)function;
+    return do_cmd(&l, cdb, 10, NULL, 0, NULL, NULL, 30000);
+}
+
 int proto_hw_status(Proto *p, BYTE out[12], DWORD *got)
 {
     Link l;
@@ -513,7 +530,13 @@ int proto_feed(Proto *p)
     BYTE cdb[10];
     int rc;
 
-    if (!proto_hopper_has_paper(p)) return PROTO_NODOCS;
+    /*
+     * Do not gate on the hopper sensor. It is one bit (`byte3 & 0x80`) that
+     * disagrees with reality on this unit - it reads "empty" with paper
+     * loaded - and gating on it fails every scan before the scanner is even
+     * asked. SANE pre-checks it only for the iX500; elsewhere the feed itself
+     * reports no-documents, which is authoritative.
+     */
 
     memset(&l, 0, sizeof l); l.t = p->t;
     memset(cdb, 0, sizeof cdb);

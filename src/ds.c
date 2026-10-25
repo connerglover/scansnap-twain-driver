@@ -839,8 +839,14 @@ static TW_UINT16 ds_imageinfo(pTW_IMAGEINFO info)
     info->YResolution = g_ds.yres;
     info->ImageWidth = g_ds.page.width;
     info->ImageLength = g_ds.page.height;
+    /*
+     * BitsPerSample is per sample, not per pixel: 24-bit RGB is {8,8,8},
+     * which is what NAPS2 matches on ((RGB, 24, 3, [8,..])). Setting
+     * BitsPerSample[0] = 24 makes it reject the image as "Unsupported pixel
+     * type".
+     */
     info->SamplesPerPixel = (TW_INT16)(g_ds.page.bpp == 24 ? 3 : 1);
-    info->BitsPerSample[0] = (TW_INT16)g_ds.page.bpp;
+    info->BitsPerSample[0] = (TW_INT16)(g_ds.page.bpp == 24 ? 8 : g_ds.page.bpp);
     if (g_ds.page.bpp == 24) {
         info->BitsPerSample[1] = 8;
         info->BitsPerSample[2] = 8;

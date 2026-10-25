@@ -137,18 +137,29 @@ int main(void)
     CHECK(p->armed == 1, "window armed");
     CHECK(p->interlace == 0, "interlace %d", p->interlace);
 
-    /* --- feed: hopper, OBJECT POSITION, TUR --- */
+    /* --- feed: OBJECT POSITION, TUR (no hopper pre-check) --- */
     {
-        BYTE hw[12];
-        memset(hw, 0, sizeof hw);
-        hw[3] = 0x00;                 /* paper present */
-        mock_push(hw, 12);
-        push_ok();                    /* GET HW STATUS status */
-        push_ok();                    /* object position */
+        push_ok();                    /* object position feed */
         push_ok();                    /* test unit ready */
     }
     rc = proto_feed(p);
     CHECK(rc == PROTO_OK, "proto_feed rc=%d", rc);
+
+    /*
+     * Feed without a hopper pre-check must still report an empty feeder, and
+     * the scanner's answer to the feed is what decides it.
+     */
+    {
+        BYTE sense[0x12];
+        push_envelope_status(1);      /* CHECK CONDITION */
+        memset(sense, 0, sizeof sense);
+        sense[0] = 0x70; sense[2] = 0x03;
+        sense[12] = 0x80; sense[13] = 0x03;   /* no documents */
+        mock_push(sense, sizeof sense);
+        push_ok();
+    }
+    rc = proto_feed(p);
+    CHECK(rc == PROTO_NODOCS, "feed on empty feeder rc=%d", rc);
 
     push_ok();
     rc = proto_start_scan(p);
@@ -232,16 +243,16 @@ int main(void)
         CHECK(rc == PROTO_OK, "second command aligned rc=%d", rc);
     }
 
-    /* --- empty feeder --- */
+    /* --- the hopper sensor is advisory, not a gate --- */
     {
         BYTE hw[12];
         memset(hw, 0, sizeof hw);
-        hw[3] = 0x80;                 /* hopper empty */
+        hw[3] = 0x80;                 /* reads "empty" */
         mock_push(hw, 12);
         push_ok();
     }
-    rc = proto_feed(p);
-    CHECK(rc == PROTO_NODOCS, "empty hopper rc=%d", rc);
+    rc = proto_hw_status(p, st, &got);
+    CHECK(rc == PROTO_OK && got == 12, "hw status readable rc=%d", rc);
 
     /* --- end --- */
     push_ok();

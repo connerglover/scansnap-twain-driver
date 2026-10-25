@@ -183,8 +183,23 @@ static int run_scan(const char *outdir, int pixelType, int duplex, const char *t
               info.ImageWidth, info.ImageLength, info.PixelType,
               info.BitsPerPixel, info.Compression);
         if (pages == 0) {
+            int bpp = pixelType == TWPT_RGB ? 24 : (pixelType == TWPT_BW ? 1 : 8);
+            int spp = pixelType == TWPT_RGB ? 3 : 1;
+            int perSample = pixelType == TWPT_RGB ? 8 : bpp;
+            /*
+             * NAPS2 matches on (PixelType, BitsPerPixel, SamplesPerPixel,
+             * BitsPerSample[0]) - (RGB,24,3,8), (GRAY,8,1,8), (BW,1,1,1) -
+             * and rejects anything else with "Unsupported pixel type".
+             * BitsPerSample is per sample, not per pixel, so 24-bit colour
+             * must report 8. These are the assertions that catch it.
+             */
             CHECK(info.PixelType == pixelType, "pixel type matches request");
             CHECK(info.Compression == TWCP_NONE, "uncompressed");
+            CHECK(info.BitsPerPixel == bpp, "BitsPerPixel %d", info.BitsPerPixel);
+            CHECK(info.SamplesPerPixel == spp, "SamplesPerPixel %d", info.SamplesPerPixel);
+            CHECK(info.BitsPerSample[0] == perSample,
+                  "BitsPerSample[0] %d (per sample)", info.BitsPerSample[0]);
+            CHECK(info.Planar == FALSE, "Planar FALSE");
         }
 
         for (;;) {

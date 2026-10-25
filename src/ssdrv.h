@@ -137,7 +137,7 @@ void   proto_destroy(Proto *p);
 
 int  proto_open(Proto *p);                    /* TEST UNIT READY + INQUIRY + VPD */
 int  proto_begin(Proto *p, const ScanJob *job);   /* mode selects + set window + lamp */
-int  proto_feed(Proto *p);                    /* hopper check + OBJECT POSITION feed + TUR */
+int  proto_feed(Proto *p);                    /* OBJECT POSITION feed + TUR */
 int  proto_start_scan(Proto *p);              /* SCAN */
 int  proto_pixel_size(Proto *p, int back, LONG *w, LONG *h);
 int  proto_wait_image(Proto *p, int back, LONG bytes, int attempts);  /* f1/0x10 poll */
@@ -146,6 +146,8 @@ int  proto_end(Proto *p);                     /* cancel + buffering off */
 int  proto_hw_status(Proto *p, BYTE out[12], DWORD *got);
 int  proto_hopper_has_paper(Proto *p);
 int  proto_test_unit_ready(Proto *p);          /* one plain TUR round trip */
+int  proto_scanner_control(Proto *p, int function);  /* f1: 0 ADF, 4 cancel, 5 lamp */
+int  proto_object_position(Proto *p, int function);  /* 31: 1 feed, 4 halt */
 
 /* Scripted transport for tools/selftest.c and g_cfg.mock. */
 void  mock_push(const BYTE *data, DWORD len);

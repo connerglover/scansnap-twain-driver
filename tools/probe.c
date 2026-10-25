@@ -90,11 +90,22 @@ int main(int argc, char **argv)
     }
 
     if (!strcmp(cmd, "scan")) {
-        Session *s = session_create();
+        Session *s;
         ScanJob job;
         Page page;
         int back = 0, pages = 0;
 
+        /*
+         * WinUSB grants one handle per interface: the probe already holds one,
+         * so a second CreateFile fails with ACCESS_DENIED and session_create
+         * finds nothing. Release ours before the session opens its own.
+         */
+        proto_destroy(p);
+        transport_close(t);
+        p = NULL;
+        t = NULL;
+
+        s = session_create();
         if (!s) { printf("session_create failed\n"); return 1; }
         session_open(s);
         memset(&job, 0, sizeof job);
@@ -121,6 +132,7 @@ int main(int argc, char **argv)
         }
         session_destroy(s);
         printf("%d page(s)\n", pages);
+        return 0;
     }
 
     proto_destroy(p);
