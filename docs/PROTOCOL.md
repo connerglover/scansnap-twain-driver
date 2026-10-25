@@ -71,7 +71,7 @@ Status 0 = good, 8 = busy, else CHECK CONDITION -> `REQUEST SENSE (0x03)`,
 | `0x1b` | SCAN | data-out is the window id list (`00`, `80`) |
 | `0x31` | OBJECT POSITION | `01` feed, `04` halt |
 | `0x28` | READ | datatype `0x80` pixel size (32 B), `0x00` image (3-byte length) |
-| `0xc2` | GET HW STATUS | 12 B; `byte3 & 0x80` = hopper **empty** |
+| `0xc2` | GET HW STATUS | 12 B; `byte3 & 0x80` = hopper **empty** (advisory - see below) |
 | `0xf1` | SCANNER CONTROL | `00` ADF, `04` cancel, `05` lamp on; bit 4 set + `0x10` = read-image-count |
 | `0x2a` | SEND | LUT `0x83`, JPEG q-table `0x88` (only iX500/iX100 need these) |
 
@@ -88,6 +88,26 @@ Window descriptor (**observed** in both implementations):
 2a order (0 line, 1 dot)  2b order arg (0 RGB, 5 BGR)
 35 paper select (0xc0 non-standard)  36 paper width  3a paper length
 ```
+
+## 3a. The hopper bit is advisory
+
+**Observed** on this unit: `GET HW STATUS` returns `00 00 00 80 00 ...`
+permanently - byte 3 bit 7 set, which both this driver and sane-backends read
+as "hopper empty" - while paper sits in the ADF and `err` (byte 7) is 0. The
+`OBJECT POSITION feed` that follows answers sense `03/80/03`, i.e. the scanner
+itself also reports no documents, so the two agree even though the feeder is
+loaded.
+
+**Consequence**: do not gate a scan on that bit. SANE pre-checks it only for
+the iX500 ("errors if op is called with no paper at the beginning of a batch");
+everywhere else the feed's own answer is authoritative. This driver used to
+gate on it and aborted every scan before issuing a command.
+
+Not yet established: whether this unit reads the bit correctly on the
+U-turn ADF path only, and whether its front **Return Scan** feeder is the one
+the sensor actually tracks. The driver drives the U-turn path
+(`feedFromBack = 0`), so a sheet loaded in the front slot would explain the
+reading exactly.
 
 ## 4. Generation behaviour (iX1300 == iX1600 profile)
 

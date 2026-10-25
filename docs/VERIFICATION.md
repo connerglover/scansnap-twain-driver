@@ -113,22 +113,25 @@ it is now not, and `msg_getfirst` returns the source above.
 
 ## 5. Hardware
 
-The scanner is now attached and bound to `usbscan.sys`
-(`USB\VID_04C5&PID_162C\8&2EFE0359&0&7`, `Present = True`, `Class = Image`,
-`Service = usbscan`, problem code 0). Its descriptors, read live through
-`IOCTL_GET_DEVICE_DESCRIPTOR` / `IOCTL_GET_PIPE_CONFIGURATION`:
+The scanner is attached and now runs on **WinUSB** (the rebind took effect
+after the reboot): `Class = USBDevice`, `Service = WINUSB`, problem code 0,
+and `SetupDi` enumerates it by the interface GUID. The driver logs:
+
+```
+winusb: bulk pipe 0x81 maxpacket 1024
+winusb: bulk pipe 0x02 maxpacket 1024
+winusb: opened \\?\usb#vid_04c5&pid_162c#8&2efe0359&0&7#{6e7c3d2a-...}
+```
 
 | Fact | Observed value |
 |---|---|
 | Device | `04c5:162c`, bcdDevice `0100` |
 | Pipes | exactly two, both bulk: `0x81` IN, `0x02` OUT, 1024-byte packets |
-| Channel alignment | 1024 read, 1024 write (`IOCTL_GET_CHANNEL_ALIGN_RQST`) |
+| Channel alignment | 1024 read, 1024 write (queried while on usbscan) |
 | Interrupt / event pipe | none (`EventChannelSize` = 0) |
-| Endpoint state | both `GET_STATUS` = `0x0000`, i.e. **not** halted |
+| Handles | WinUSB grants one per interface - a second `CreateFile` is `ACCESS_DENIED` |
 
-That replaces the "pipe numbers are guessed" caveat: the driver's defaults
-`pipeIn = 0x81`, `pipeOut = 0x02` are what the unit reports, and the WinUSB
-path enumerates the same pair from the interface descriptor.
+The pipe numbers the driver hardcodes are what the unit reports.
 
 A real session did reach the scanner once. The 23:30 log is a genuine one:
 
@@ -143,32 +146,29 @@ So INQUIRY, VPD, the `SET WINDOW` interlace probe and the pixel-size READ all
 work against the real unit, and Letter at 300 dpi is 2550x3300 as expected.
 Every response above was read from the device, not synthesised.
 
-### The unit is currently wedged
+### The wedge was the pending reboot
 
-The scan that produced that log was interrupted (the session's machine went
-down mid-run), and the unit is now stuck in its own "scanning" state: the
-Scan button flashes blue, bulk OUT is accepted, and bulk IN never completes.
-Measured on the attached unit:
+Before the reboot the unit looked dead on bulk IN: writes completed, reads
+never did, control transfers still worked, and no software sequence
+(`CANCEL_IO`, `RESET_PIPE`, `CLEAR_FEATURE(HALT)`, `SET_INTERFACE`, draining
+243 KB of queued data) changed that. The cause was not the firmware: the
+WinUSB rebind was staged but not active, so `\\.\Usbscan0` still answered from
+a half-switched driver stack while `SetupDi` saw no interfaces for our GUID.
+`pnputil` had said so all along - *"Device is pending system reboot to complete
+a previous operation"*.
 
-| Probe | Result |
-|---|---|
-| `TEST UNIT READY`, 45 s deadline | no bulk-IN completion, three times |
-| writes of the 31-byte envelope | complete immediately every time |
-| reads of 1024 bytes / 262144 bytes | never complete |
-| control transfers (`GET_STATUS`, `GET_DESCRIPTOR`) | succeed |
-| endpoint halt state | clear, so not an endpoint stall |
-| `IOCTL_CANCEL_IO` + `IOCTL_RESET_PIPE` | succeed, change nothing |
-| `CLEAR_FEATURE(ENDPOINT_HALT)`, `SET_INTERFACE 0:0` | succeed, change nothing |
-| draining 243 KB of queued data-in | succeeds; the unit then stays silent |
+After the reboot the unit runs on WinUSB and every command answers:
 
-Control transfers still working while bulk-IN never does is the discriminator:
-the USB stack and the endpoints are fine, the device firmware is not. No
-software sequence reached it, so **it needs a power cycle** (unplug the USB
-cable, or close and reopen the ADF cover, which is how this generation powers
-on).
+```
+proto: inquiry 'FUJITSU' 'ScanSnap iX1300' rev '0M00' adf 1 flatbed 0
+proto: vpd basic 600x600 max 600x600 window 5184x71080 color 1 gray 1 lineart 1
+proto: colour interlace 0 accepted
+proto: pixel size front 2550x3300
+proto: sense key 0x03 asc 0x80 ascq 0x03     (feed: no documents)
+```
 
-The ban on `IOCTL_SET_TIMEOUT` in `src/usb.c` is now explained rather than
-guessed: with any non-zero `TimeoutRead` the device aborts every transfer with
+The ban on `IOCTL_SET_TIMEOUT` in `src/usb.c` is explained rather than guessed:
+with any non-zero `TimeoutRead` the usbscan path aborts every transfer with
 `ERROR_OPERATION_ABORTED` (995). All timeouts are user mode.
 
 ## What the crash exposed, and what was fixed
@@ -196,6 +196,44 @@ Three defects were real, independent of the crash, and are fixed:
 `build\ScanSnapTWAIN.ini` is now written by `tools\build.cmd` with `Mock=1`, so
 the test tools are self-contained. `probe.exe` overrides `Mock` and enables
 logging in code, because it is the hardware tool.
+
+Four more were found by driving the scanner from NAPS2:
+
+4. **IMAGEINFO reported the wrong `BitsPerSample`.** It sent `{24,8,8,...}`
+   for 24-bit colour, i.e. bits *per pixel* in the first slot. NAPS2 matches
+   on `(PixelType, BitsPerPixel, SamplesPerPixel, BitsPerSample[0])` and threw
+   `Unsupported pixel type: 24 2 3 24,8,8,0,0,0,0,0` on every page.
+   `BitsPerSample` is per sample: `{8,8,8}`. `twaintest` checked none of
+   those fields; it now checks all four, and the new assertion was confirmed
+   to fail against the old code.
+5. **A scan was gated on the hopper sensor.** `proto_feed` returned
+   `PROTO_NODOCS` from `byte3 & 0x80` before sending anything. That bit reads
+   "empty" on this unit with paper loaded, so no scan ever started. SANE
+   pre-checks it only for the iX500; the feed's own `03/80/03` is
+   authoritative. See PROTOCOL.md section 3a.
+6. **`probe scan` opened the interface twice.** WinUSB grants one handle, so
+   the session's `CreateFile` failed with `ACCESS_DENIED` and
+   `session_create` returned NULL. It releases the probe's handle first.
+7. **Mock defects the above exposed.** A new synthetic session inherited the
+   previous session's response queue, and the no-documents path pre-pushed
+   sense data that `do_cmd` then fetched again, leaving the mock one packet out
+   of step for every later command.
+
+### Still open on hardware
+
+A complete page: feed, SCAN, image READ and duplex. The feed currently
+answers `03/80/03` with paper in the U-turn ADF and `err = 0`, and no software
+sequence changes it (`CANCEL`, `halt`, lamp-on, three feeds). Two
+explanations remain, both external to the driver:
+
+- the sheet is in the front **Return Scan** slot, which the driver does not
+  drive (`feedFromBack = 0`), or
+- the unit is latched after the interrupted scan and wants a power cycle.
+
+Duplex is also untested: this unit's VPD reports `duplexOffset = 0` even
+though the hardware is duplex (two CIS, 60 ipm), so `0x2e/0x2f` is not the
+field the iX1600 profile puts there. Nothing gates on it - `CAP_DUPLEX` is
+answered unconditionally - but the real bit is unidentified.
 
 ## 6. Install state
 
