@@ -339,19 +339,23 @@ void transport_close(Transport *t)
 }
 
 /*
- * CancelIoEx halts the usbscan endpoint, so after a timeout every later
- * transfer fails instantly with ERROR_GEN_FAILURE (31) until the pipe is
- * reset. Reset it here, and only here: one dead transfer must not poison the
- * rest of the session.
+ * A cancelled transfer leaves the endpoint halted, so every later transfer
+ * fails instantly with ERROR_GEN_FAILURE (31) until the pipe is reset. Both
+ * transports need this after a timeout or a hard error; one dead transfer must
+ * not poison the rest of the session.
  */
-static void usbscan_reset_pipes(HANDLE f)
+static void reset_pipes(Transport *t)
 {
-    int pipe;
-    DWORD returned;
-
-    for (pipe = PIPE_READ; pipe <= PIPE_WRITE; pipe++)
-        DeviceIoControl(f, IOCTL_USBSCAN_RESET_PIPE, &pipe, sizeof pipe,
-                        NULL, 0, &returned, NULL);
+    if (t->viaUsbscan) {
+        int pipe;
+        DWORD returned;
+        for (pipe = PIPE_READ; pipe <= PIPE_WRITE; pipe++)
+            DeviceIoControl(t->file, IOCTL_USBSCAN_RESET_PIPE, &pipe, sizeof pipe,
+                            NULL, 0, &returned, NULL);
+    } else if (t->winusb) {
+        WinUsb_ResetPipe(t->winusb, t->pipeIn);
+        WinUsb_ResetPipe(t->winusb, t->pipeOut);
+    }
 }
 
 static int sync_io(Transport *t, BOOL write, BYTE *data, DWORD *len, DWORD timeoutMs)
@@ -388,16 +392,15 @@ static int sync_io(Transport *t, BOOL write, BYTE *data, DWORD *len, DWORD timeo
                      t->viaUsbscan ? "usbscan" : "winusb",
                      write ? "write" : "read", timeoutMs);
                 CloseHandle(ov.hEvent);
-                if (t->viaUsbscan) usbscan_reset_pipes(t->file);
+                reset_pipes(t);
                 return 0;
             }
-        } else if (t->viaUsbscan && err == ERROR_GEN_FAILURE) {
+        } else if (err == ERROR_GEN_FAILURE) {
             /* endpoint left halted by an earlier cancel */
-            usbscan_reset_pipes(t->file);
+            reset_pipes(t);
             ok = write ? WriteFile(t->file, data, *len, &done, &ov)
                        : ReadFile(t->file, data, *len, &done, &ov);
-            err = GetLastError();
-            if (!ok && err == ERROR_IO_PENDING) {
+            if (!ok && GetLastError() == ERROR_IO_PENDING) {
                 if (WaitForSingleObject(ov.hEvent, timeoutMs) == WAIT_OBJECT_0)
                     ok = GetOverlappedResult(t->file, &ov, &done, FALSE);
                 else {
@@ -414,7 +417,7 @@ static int sync_io(Transport *t, BOOL write, BYTE *data, DWORD *len, DWORD timeo
              t->viaUsbscan ? "usbscan" : "winusb",
              write ? "write" : "read", GetLastError(), done);
         CloseHandle(ov.hEvent);
-        if (t->viaUsbscan) usbscan_reset_pipes(t->file);
+        reset_pipes(t);
         return 0;
     }
     CloseHandle(ov.hEvent);
@@ -684,12 +687,4 @@ int transport_bulk_in(Transport *t, BYTE *data, DWORD *len, DWORD timeoutMs)
         return 1;
     }
     return sync_io(t, FALSE, data, len, timeoutMs);
-}
-
-void transport_reset(Transport *t)
-{
-    if (!t || t->isMock || t->viaUsbscan) return;
-    WinUsb_ResetPipe(t->winusb, t->pipeIn);
-    WinUsb_ResetPipe(t->winusb, t->pipeOut);
-    LOGF("winusb: pipes reset\n");
 }

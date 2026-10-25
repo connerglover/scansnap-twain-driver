@@ -72,7 +72,6 @@ Transport *transport_open(char *ppath, size_t pathLen);
 void transport_close(Transport *t);
 int  transport_bulk_out(Transport *t, const BYTE *data, DWORD len, DWORD timeoutMs);
 int  transport_bulk_in(Transport *t, BYTE *data, DWORD *len, DWORD timeoutMs);
-void transport_reset(Transport *t);
 const char *transport_kind(const Transport *t);
 
 /* Opens a scripted/mock transport used by tools/selftest and g_cfg.mock. */
