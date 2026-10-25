@@ -199,24 +199,57 @@ logging in code, because it is the hardware tool.
 
 ## 6. Install state
 
-`C:\Windows\twain_32` holds `ScanSnap-iX1300.ds` and `ScanSnapTWAIN.ini` next
-to the in-box `wiatwain.ds`, so the data source is installed where the 32-bit
-DSM looks. **The installed copy predates the fixes above**: it is the 17:57
-build, and `C:\Windows\twain_32` is not writable from a non-elevated shell
-(`cp` reports "Permission denied"). Re-run `install\install.ps1` elevated, or
-copy `build\ScanSnap-iX1300.ds` over it, before judging the driver from NAPS2.
+Installed, all verified from this session:
 
-Still open, and both are one elevated command away:
+| Step | Result |
+|---|---|
+| `C:\Windows\twain_32\ScanSnap-iX1300.ds` | byte-identical to `build\` (post-fix) |
+| `HKLM\SOFTWARE\WOW6432Node\TWAIN\DataSources` | `ScanSnap-iX1300` = the .ds path |
+| Driver package | `oem31.inf` published, "up-to-date on device" |
+| Catalog | SHA-256, signed, `signtool verify /pa` clean |
+| Certificate | in `LocalMachine\{My,Root,TrustedPublisher}` with a persisted key |
 
-- `HKLM\SOFTWARE\WOW6432Node\TWAIN\DataSources` is **absent**; `install.ps1`
-  creates it (for the legacy DSM only - the 2.x DSM finds the file directly).
-- The WinUSB rebind (`install\iX1300-TWAIN.inf`) has not been applied; the
-  unit still uses `usbscan.sys`, which the driver supports. `pnputil`,
-  `Disable-PnpDevice` and `pnputil /restart-device` all returned
-  "Access is denied" from this non-elevated shell.
+Elevation works non-interactively here: `Start-Process -Verb RunAs` with the
+full path to `System32\WindowsPowerShell\v1.0\powershell.exe` returns, so
+`install\install.ps1` runs end to end.
 
-Nothing in the TWAIN path depends on either: `dsmtest` proves discovery,
-`OPENDS`, capabilities, transfer and close through NAPS2's real
-`twaindsm.dll`. What is **not** yet proven on hardware is a complete scan
-(feed, SCAN, image READ, duplex), because the unit is wedged; that needs the
-power cycle above, then `probe.exe scan out`.
+### Four bugs in the install scripts
+
+These blocked the install and are fixed:
+
+1. **SDK tool discovery picked the wrong directory.** `Sort-Object Name
+   -Descending` over `Windows Kits\10\bin` compares strings, so `x86` sorts
+   above `10.0.26100.0` and the script looked for `bin\x86\x64\makecat.exe`.
+   It now parses the version and searches each version/arch tree.
+2. **`$PSScriptRoot` in a `param` default is empty.** With `[CmdletBinding()]`
+   the default is evaluated before the automatic variable is set, so
+   `Join-Path $PSScriptRoot ...` threw on every run. Paths are resolved in the
+   body now.
+3. **`makecat.exe` writes SHA-1 hashes; PnP wants SHA-256.** `pnputil`
+   rejected the catalog with "The hash for the file is not present in the
+   specified catalog file". The WDK's `inf2cat` is the usual fix, but it is not
+   part of the SDK; `New-FileCatalog -CatalogVersion 2` produces the SHA-256
+   catalog PnP accepts, and the package then installs.
+4. **`signtool /n <subject>` found no certificate.** `-n` matches only a plain
+   CN; this subject has a parenthesised value. Selection is by thumbprint
+   (`/sha1`) now.
+
+Two related environment traps, both handled: the `Cert:` drive is missing when
+a PowerShell 7 directory is in `PSModulePath` (the Security module fails to
+load, which also breaks `New-SelfSignedCertificate` and `New-FileCatalog`), so
+the script imports the module by full path and uses the .NET store; and the
+certificate must be imported with `PersistKeySet`, or `signtool` sees
+`HasPrivateKey` but cannot acquire the key.
+
+`install.ps1` also no longer trusts a stale catalog: it regenerates when the
+INF's SHA-256 is not inside the existing `.cat`. And `pnputil` exit codes 3010
+(reboot required) and 259 (already installed) are treated as success instead of
+warning.
+
+What is **not** yet proven on hardware is a complete scan (feed, SCAN, image
+READ, duplex), because the unit is wedged; that needs the power cycle above,
+then `probe.exe scan out`.
+
+`dsmtest` proves discovery, `OPENDS`, capabilities, transfer and close through
+NAPS2's real `twaindsm.dll`, so the TWAIN path itself does not depend on any of
+the above.

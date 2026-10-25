@@ -31,17 +31,32 @@ process (`lib\NAPS2.Worker.exe`), and the 32-bit DSM only loads 32-bit sources.
 powershell -ExecutionPolicy Bypass -File install\install.ps1
 ```
 
-This
+Run it **elevated**: it writes `C:\Windows\twain_32`, the machine certificate
+stores and the driver store. This
 
 1. copies `ScanSnap-iX1300.ds` to `C:\Windows\twain_32` (plus a default
    `ScanSnapTWAIN.ini`),
 2. registers the legacy DSM fallback key
    `HKLM\SOFTWARE\WOW6432Node\TWAIN\DataSources`,
-3. installs `install\iX1300-TWAIN.inf`, binding the scanner to WinUSB so the
+3. builds and signs `install\ScanSnap-iX1300.cat` if it does not already cover
+   the INF,
+4. installs `install\iX1300-TWAIN.inf`, binding the scanner to WinUSB so the
    driver does not need `usbscan.sys` or PFU's USD.
 
-`-SkipUsb` leaves the existing USB binding alone; the driver then opens
-`\\.\UsbscanN` instead, which works while ScanSnap Home is still installed.
+`-SkipUsb` skips steps 3 and 4, leaving the existing USB binding alone; the
+driver then opens `\\.\UsbscanN` instead, which works while ScanSnap Home is
+still installed.
+
+### The catalog
+
+PnP will not take an unsigned driver package, and the SDK's `makecat.exe`
+produces **SHA-1** member hashes, which current Windows rejects with
+"The hash for the file is not present in the specified catalog file".
+`install.ps1` therefore calls `New-FileCatalog -CatalogVersion 2` (SHA-256)
+instead, and signs the result with a self-signed code-signing certificate that
+it puts in `LocalMachine\My`, `Root` and `TrustedPublisher` - so the package is
+trusted on this machine only. Both steps are in `install\make-catalog.ps1`,
+which also works when the WDK (and therefore `inf2cat.exe`) is not installed.
 
 ## Use with NAPS2
 

@@ -52,14 +52,46 @@ Write-Host 'Registered DSM fallback key.'
 if (-not $SkipUsb) {
     $inf = Join-Path $PSScriptRoot 'iX1300-TWAIN.inf'
     $cat = Join-Path $PSScriptRoot 'ScanSnap-iX1300.cat'
-    if (-not (Test-Path $cat)) {
-        Write-Host 'No signed catalog yet; creating one (self-signed, this machine only).'
-        & (Join-Path $PSScriptRoot 'make-catalog.ps1') | Out-Host
+
+    # A catalog is only valid for the exact INF it was built from; a stale one
+    # makes pnputil fail with "The hash for the file is not present in the
+    # specified catalog file". Regenerate unless the INF's hash is in there.
+    $needCatalog = $true
+    if (Test-Path $cat) {
+        $infBytes = [IO.File]::ReadAllBytes($inf)
+        $infHash = [Security.Cryptography.SHA256]::Create().ComputeHash($infBytes)
+        $catBytes = [IO.File]::ReadAllBytes($cat)
+        # New-FileCatalog stores the raw member hash, so look for the bytes.
+        $needCatalog = $true
+        for ($i = 0; $i -le $catBytes.Length - $infHash.Length; $i++) {
+            $same = $true
+            for ($j = 0; $j -lt $infHash.Length; $j++) {
+                if ($catBytes[$i + $j] -ne $infHash[$j]) { $same = $false; break }
+            }
+            if ($same) { $needCatalog = $false; break }
+        }
+        if (-not $needCatalog) { Write-Host 'Catalog already covers this INF.' }
     }
+    if ($needCatalog) {
+        Write-Host 'Building a catalog for this INF (self-signed, this machine only).'
+        & (Join-Path $PSScriptRoot 'make-catalog.ps1') | Out-Host
+        if ($LASTEXITCODE -ne 0) { throw 'make-catalog.ps1 failed.' }
+    }
+
     Write-Host "Binding the scanner to WinUSB ($inf)"
     pnputil /add-driver $inf /install
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning "pnputil returned $LASTEXITCODE. If the scanner is unplugged, plug it in and rerun: pnputil /add-driver `"$inf`" /install"
+    switch ($LASTEXITCODE) {
+        0 { }
+        # 3010 = ERROR_SUCCESS_REBOOT_REQUIRED: the package was added; the
+        # reboot is what completes the binding on the present device.
+        3010 { Write-Host 'Driver package added; reboot to complete the binding.' }
+        # 259 = ERROR_NO_MORE_ITEMS: package already present and up to date.
+        259 { Write-Host 'Driver package already installed and current.' }
+        default {
+            Write-Warning ("pnputil returned $LASTEXITCODE. If the scanner is " +
+                           "unplugged, plug it in and rerun: pnputil /add-driver " +
+                           "`"$inf`" /install")
+        }
     }
     Write-Host ''
     Write-Host 'Verify with:  Get-PnpDevice | Where-Object InstanceId -like "*VID_04C5&PID_162C*"'

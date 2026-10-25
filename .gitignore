@@ -8,3 +8,6 @@ build/
 build/out/
 *.user
 twain_32/
+# Signed per machine by install\make-catalog.ps1; regenerated on install.
+install/*.cat
+install/*.cdf
