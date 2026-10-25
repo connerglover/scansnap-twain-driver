@@ -203,15 +203,33 @@ Installed, all verified from this session:
 
 | Step | Result |
 |---|---|
-| `C:\Windows\twain_32\ScanSnap-iX1300.ds` | byte-identical to `build\` (post-fix) |
+| `C:\Windows\twain_32\ScanSnap-iX1300.ds` | byte-identical to `build\` (all fixes) |
 | `HKLM\SOFTWARE\WOW6432Node\TWAIN\DataSources` | `ScanSnap-iX1300` = the .ds path |
-| Driver package | `oem31.inf` published, "up-to-date on device" |
+| Driver package | `oem31.inf` published, device assigned to it |
 | Catalog | SHA-256, signed, `signtool verify /pa` clean |
 | Certificate | in `LocalMachine\{My,Root,TrustedPublisher}` with a persisted key |
+| Device | `Class = USBDevice`, `Service = WINUSB`, problem code 0 |
 
 Elevation works non-interactively here: `Start-Process -Verb RunAs` with the
 full path to `System32\WindowsPowerShell\v1.0\powershell.exe` returns, so
 `install\install.ps1` runs end to end.
+
+### The WinUSB switch needs a reboot
+
+`pnputil` says so directly: *"Device is pending system reboot to complete a
+previous operation"* (exit 50 for `/restart-device`). Until then the picture is
+inconsistent, and that inconsistency is worth knowing about:
+
+| Signal | Reads as |
+|---|---|
+| Device class / service | `USBDevice` / `WINUSB` - the new binding |
+| `DeviceInterfaceGUIDs` on the device key | our GUID, present |
+| `SetupDiGetClassDevs` for that GUID | **zero interfaces** |
+| `\\.\Usbscan0` | still openable, though no usbscan device node exists |
+
+So the driver still falls back to the stale usbscan symlink and sees the wedged
+unit. After the reboot the WinUSB interface should enumerate, and the winusb
+path - whose pipe reset was just fixed - becomes the live one.
 
 ### Four bugs in the install scripts
 
