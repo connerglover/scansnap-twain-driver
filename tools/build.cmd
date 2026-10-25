@@ -24,5 +24,14 @@ cl /nologo /W3 /O2 /MT %DEFS% %INC% ..\..\tools\twaintest.c /Fe..\twaintest.exe 
 cl /nologo /W3 /O2 /MT %DEFS% %INC% ..\..\tools\dsmtest.c /Fe..\dsmtest.exe /link user32.lib || (popd & exit /b 1)
 
 popd
+
+rem Test tools read ScanSnapTWAIN.ini from their own directory, so builds are
+rem self-contained: every tool here runs the synthetic scanner. probe overrides
+rem Mock in code because it is the hardware tool.
+1>build\ScanSnapTWAIN.ini echo [Driver]
+1>>build\ScanSnapTWAIN.ini echo Mock=1
+1>>build\ScanSnapTWAIN.ini echo LogEnable=0
+
 echo.
-echo Built build\ScanSnap-iX1300.ds, build\selftest.exe, build\probe.exe
+echo Built build\ScanSnap-iX1300.ds, build\probe.exe, build\selftest.exe,
+echo       build\mockscan.exe, build\twaintest.exe, build\dsmtest.exe

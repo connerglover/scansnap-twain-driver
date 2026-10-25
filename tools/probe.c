@@ -37,12 +37,15 @@ int main(int argc, char **argv)
     int rc;
 
     g_hinst = GetModuleHandleA(NULL);
-    memset(&g_cfg, 0, sizeof g_cfg);
-    g_cfg.interlace = -1;
-    {
-        const char *ini = argc > 2 ? argv[2] : NULL;
-        (void)ini;
-    }
+    config_load();
+    /*
+     * build\ScanSnapTWAIN.ini defaults to Mock=1 so the test tools need no
+     * hardware. probe is the hardware tool: always talk to the scanner.
+     */
+    g_cfg.mock = 0;
+    g_cfg.logEnable = 1;          /* probe is the diagnostic: always log */
+    if (argc > 3) strcpy_s(g_cfg.logPath, sizeof g_cfg.logPath, argv[3]);
+    LOGF("probe: start\n");
 
     t = transport_open(path, sizeof path);
     if (!t) {

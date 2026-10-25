@@ -108,12 +108,32 @@ Consequences:
 - a batch that fed a sheet is closed with `SCANNER CONTROL cancel` when the
   feeder runs empty; the `03/80/03` sense *is* the normal end of batch
 
-## 5. Not established on hardware
+## 5. Established on hardware
 
-- Actual USB descriptors (endpoint numbers, packet sizes, interface count,
-  interrupt endpoint). The driver enumerates bulk pipes at runtime and logs them,
-  so it does not depend on the guess.
-- What the iX1300's INQUIRY/VPD actually returns; parsing falls back to A4 /
-  150-1200 dpi if VPD fails.
-- Which colour interleaving the unit accepts (probed).
+Read from the attached unit (`04c5:162c`, `usbscan.sys`):
+
+- **USB descriptors**: exactly two pipes, both bulk, `0x81` IN and `0x02` OUT,
+  1024-byte max packet, no interrupt/event pipe, 1024-byte channel alignment.
+  The driver's defaults match; WinUSB enumerates the same pair.
+- **INQUIRY**: vendor `FUJITSU`, product `ScanSnap iX1300`, ROM revision
+  `0M00` (the mock had `1.50`), ADF present, no flatbed.
+- **VPD**: basic resolution 600x600, max 600x600, window limit 5184x71080
+  units, colour + gray + line art. The standard-resolution bitmap is the unit's
+  own; the hardcoded 150-1200 dpi fallback list is wrong for it and is only
+  used if VPD fails entirely.
+- **Colour interleaving**: `SET WINDOW` with order `0` (RGB dot) is accepted.
+- **Pixel size** after `SCAN` at 300 dpi: 2550x3300 for Letter.
+- **`0x2e/0x2f` is not the duplex field.** The unit is a duplex scanner (two
+  CIS, 60 ipm) but the value there reads 0, so the iX1600 model is wrong at
+  that offset. Nothing depends on it: `CAP_DUPLEX` is answered
+  `TWDX_1PASSDUPLEX` unconditionally and `j.duplex` comes from
+  `CAP_DUPLEXENABLED`. Where the real capability bit lives is still open.
+
+`0M00` also contradicts the mock, which was written from the iX1600 profile.
+
+## 6. Not established on hardware
+
+- A complete scan: feed, SCAN, image READ, duplex, end-of-batch. The unit
+  wedged in firmware after an interrupted scan (see VERIFICATION.md section 5),
+  so this needs a power cycle and `probe.exe scan out`.
 - Straight-path / return-scan mode: only the U-turn ADF path is driven.

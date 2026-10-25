@@ -77,6 +77,31 @@ typedef struct {
     Sense lastSense;
 } Link;
 
+/*
+ * Reads the 13-byte status envelope. If the device is out of step - a short
+ * data-in left image bytes queued, or a previous session died mid-batch - the
+ * bytes at the head of the pipe are not the envelope. Scan forward for one
+ * (bounded) so the *next* command starts aligned instead of failing forever.
+ */
+static int read_status(Link *l, BYTE *st, DWORD timeoutMs)
+{
+    int attempts;
+
+    for (attempts = 0; attempts < 64; attempts++) {
+        DWORD got = STAT_LEN;
+
+        if (!transport_bulk_in(l->t, st, &got, timeoutMs)) return 0;
+        if (got == STAT_LEN && st[0] == STAT_CODE) return 1;
+        if (got < STAT_LEN) {
+            LOGF("proto: short status packet (%lu)\n", got);
+            return 0;
+        }
+        LOGF("proto: resync, discarded %lu bytes (head 0x%02x)\n", got, st[0]);
+    }
+    LOGF("proto: no status envelope after %d reads\n", attempts);
+    return 0;
+}
+
 /* One SCSI command: envelope, optional data-out, optional data-in, status. */
 static int do_cmd(Link *l, const BYTE *cdb, int cdbLen,
                   const BYTE *outBuf, DWORD outLen,
@@ -84,7 +109,6 @@ static int do_cmd(Link *l, const BYTE *cdb, int cdbLen,
 {
     BYTE env[CMD_LEN];
     BYTE st[STAT_LEN];
-    DWORD got = STAT_LEN;
 
     memset(env, 0, sizeof env);
     env[0] = 0x43;
@@ -100,14 +124,7 @@ static int do_cmd(Link *l, const BYTE *cdb, int cdbLen,
         *inLen = want;
     }
 
-    if (!transport_bulk_in(l->t, st, &got, timeoutMs) || got != STAT_LEN) {
-        LOGF("proto: short status packet (%lu)\n", got);
-        return PROTO_IO;
-    }
-    if (st[0] != STAT_CODE) {
-        LOGF("proto: unexpected status envelope 0x%02x\n", st[0]);
-        return PROTO_IO;
-    }
+    if (!read_status(l, st, timeoutMs)) return PROTO_IO;
     if (st[STAT_OFFSET] == 0) return PROTO_OK;
     if (st[STAT_OFFSET] == 8) {
         l->lastErr = PROTO_BUSY;
@@ -627,4 +644,12 @@ int proto_end(Proto *p)
     if (g_cfg.bufferMode) mode_select_buffer(p, 0);
     p->armed = 0;
     return rc;
+}
+
+/* TEST UNIT READY, for tests that need one plain command round trip. */
+int proto_test_unit_ready(Proto *p)
+{
+    Link l;
+    memset(&l, 0, sizeof l); l.t = p->t;
+    return scsi_simple(&l, 0x00, 30000);
 }

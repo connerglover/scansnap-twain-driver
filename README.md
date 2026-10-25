@@ -111,3 +111,20 @@ The data source tries the WinUSB interface GUID first and falls back to
 `IOCTL_GET_DEVICE_DESCRIPTOR`, so it can be tested on a machine that still has
 ScanSnap Home installed without touching the driver binding. In that case stop
 `PfuSsMon.exe` first: it holds the device open.
+
+Both transports open overlapped and enforce their own deadlines, so a scanner
+that stops answering can never hang the TWAIN thread. Two recovery steps keep a
+reused unit usable:
+
+- **On open**, the usbscan path aborts outstanding IO, discards whatever data-in
+  a previous session left queued, and resets the pipes. Without this, a scanner
+  interrupted mid-batch answers nothing to the next session.
+- **After a timeout**, `CancelIoEx` leaves the usbscan endpoint halted, so the
+  pipe is reset immediately; otherwise every later transfer fails at once with
+  `ERROR_GEN_FAILURE` (31).
+
+If the unit is left mid-scan by a machine crash, it can wedge in firmware: the
+Scan button flashes blue, bulk OUT is accepted and bulk IN never completes,
+while control transfers still work. No software sequence clears that;
+power-cycle the scanner (unplug USB, or close and reopen the ADF cover).
+See `docs/VERIFICATION.md` section 5 for the measurements.

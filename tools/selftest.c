@@ -33,10 +33,10 @@ static void push_inquiry(void)
     buf[0] = 0x06;
     memcpy(buf + 8, "FUJITSU ", 8);
     memcpy(buf + 16, "ScanSnap iX1300 ", 16);
-    memcpy(buf + 32, "1.50", 4);
+    memcpy(buf + 32, "0M00", 4);       /* as reported by the real iX1300 */
     buf[0x2D] = 0x01;                  /* has ADF */
     buf[0x2A] = 0x00; buf[0x2B] = 0x02;  /* colour offset */
-    buf[0x2E] = 0x00; buf[0x2F] = 0x02;  /* duplex offset */
+    buf[0x2E] = 0x00; buf[0x2F] = 0x00;  /* duplex offset: 0 on the unit */
     mock_push(buf, sizeof buf);
     push_envelope_status(0);
 }
@@ -111,6 +111,7 @@ int main(void)
     CHECK(p->info.basicXRes == 1200, "basic x res %d", p->info.basicXRes);
     CHECK(p->info.maxWidthUnits == 10200, "max width units %ld", p->info.maxWidthUnits);
     CHECK(p->info.stdResCount >= 3, "std res count %d", p->info.stdResCount);
+    CHECK(strcmp(p->info.version, "0M00") == 0, "rom revision '%s'", p->info.version);
 
     /* --- begin: ADF, 3 mode selects, window probe, lamp --- */
     memset(&job, 0, sizeof job);
@@ -210,6 +211,26 @@ int main(void)
     rc = proto_hw_status(p, st, &got);
     CHECK(rc == PROTO_BUSY, "hw status busy rc=%d", rc);
     CHECK(got == 12, "busy status data length %lu", got);
+
+    /* --- out of step: leftover image bytes ahead of the status envelope ---
+     * The scanner shortens a data-in, or a previous session died mid-batch,
+     * so the pipe starts with stream bytes. The command must still see a
+     * valid status and the next command must start aligned. */
+    {
+        BYTE junk[13];
+        memset(junk, 0x11, sizeof junk);      /* residual image, not 0x53 */
+        mock_push(junk, sizeof junk);
+        push_ok();
+        rc = proto_test_unit_ready(p);
+        CHECK(rc == PROTO_OK, "resync past %u stale bytes rc=%d",
+              (unsigned)sizeof junk, rc);
+
+        memset(junk, 0x22, sizeof junk);
+        mock_push(junk, sizeof junk);
+        push_ok();
+        rc = proto_test_unit_ready(p);
+        CHECK(rc == PROTO_OK, "second command aligned rc=%d", rc);
+    }
 
     /* --- empty feeder --- */
     {

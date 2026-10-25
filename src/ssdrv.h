@@ -146,6 +146,7 @@ int  proto_read_image(Proto *p, int back, BYTE *buf, DWORD want, DWORD *got);
 int  proto_end(Proto *p);                     /* cancel + buffering off */
 int  proto_hw_status(Proto *p, BYTE out[12], DWORD *got);
 int  proto_hopper_has_paper(Proto *p);
+int  proto_test_unit_ready(Proto *p);          /* one plain TUR round trip */
 
 /* Scripted transport for tools/selftest.c and g_cfg.mock. */
 void  mock_push(const BYTE *data, DWORD len);

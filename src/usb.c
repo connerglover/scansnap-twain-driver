@@ -75,6 +75,13 @@ const char *transport_kind(const Transport *t)
     return t->viaUsbscan ? "usbscan" : "winusb";
 }
 
+typedef struct {
+    USHORT usVendorId;
+    USHORT usProductId;
+    USHORT usBcdDevice;
+    USHORT usLanguageId;
+} USBSCAN_DESCRIPTOR;
+
 /* ------------------------------------------------------------- usbscan.sys
  *
  * Windows' in-box scanner class driver. It needs no PFU software and no
@@ -85,21 +92,58 @@ const char *transport_kind(const Transport *t)
 #define FILE_DEVICE_USB_SCAN 0x8000
 #define IOCTL_USBSCAN_GET_DEVICE_DESCRIPTOR \
     CTL_CODE(FILE_DEVICE_USB_SCAN, 0x0800 + 6, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define USBSCAN_TIMEOUT_IOCTL \
-    CTL_CODE(FILE_DEVICE_USB_SCAN, 0x0800 + 11, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_USBSCAN_CANCEL_IO \
+    CTL_CODE(FILE_DEVICE_USB_SCAN, 0x0800 + 1, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_USBSCAN_RESET_PIPE \
+    CTL_CODE(FILE_DEVICE_USB_SCAN, 0x0800 + 7, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-typedef struct {
-    USHORT usVendorId;
-    USHORT usProductId;
-    USHORT usBcdDevice;
-    USHORT usLanguageId;
-} USBSCAN_DESCRIPTOR;
+/* PIPE_TYPE, as usbscan.h defines it. */
+enum { PIPE_EVENT = 0, PIPE_READ, PIPE_WRITE, PIPE_ALL };
 
-typedef struct {
-    ULONG TimeoutRead;
-    ULONG TimeoutWrite;
-    ULONG TimeoutEvent;
-} USBSCAN_TIMEOUT;
+/*
+ * A scanner that a previous session left mid-batch (crash, kill, power event)
+ * still has its data-out phase or its image stream open. Its IN pipe then
+ * answers nothing while the OUT pipe keeps accepting bytes, so every command
+ * times out. Abort whatever usbscan.sys still holds, discard the stale data-in,
+ * then reset the pipes: the drain's CancelIoEx leaves the IN endpoint halted,
+ * and only IOCTL_RESET_PIPE clears that.
+ */
+static void recover_usbscan(HANDLE f)
+{
+    int pipe, round;
+    DWORD returned;
+
+    for (pipe = PIPE_READ; pipe <= PIPE_WRITE; pipe++)
+        DeviceIoControl(f, IOCTL_USBSCAN_CANCEL_IO, &pipe, sizeof pipe,
+                        NULL, 0, &returned, NULL);
+
+    for (round = 0; round < 64; round++) {
+        OVERLAPPED ov;
+        BYTE buf[4096];
+        DWORD done = 0;
+
+        memset(&ov, 0, sizeof ov);
+        ov.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
+        if (!ov.hEvent) break;
+        if (!ReadFile(f, buf, sizeof buf, &done, &ov)) {
+            if (GetLastError() != ERROR_IO_PENDING) { CloseHandle(ov.hEvent); break; }
+            if (WaitForSingleObject(ov.hEvent, 200) != WAIT_OBJECT_0) {
+                CancelIoEx(f, &ov);
+                CloseHandle(ov.hEvent);
+                break;
+            }
+            if (!GetOverlappedResult(f, &ov, &done, FALSE)) done = 0;
+        }
+        CloseHandle(ov.hEvent);
+        if (!done) break;
+        LOGF("usbscan: discarded %lu stale bytes\n", done);
+    }
+
+    for (pipe = PIPE_READ; pipe <= PIPE_WRITE; pipe++)
+        DeviceIoControl(f, IOCTL_USBSCAN_RESET_PIPE, &pipe, sizeof pipe,
+                        NULL, 0, &returned, NULL);
+}
+
 
 static Transport *open_usbscan(void)
 {
@@ -109,12 +153,11 @@ static Transport *open_usbscan(void)
         HANDLE f;
         USBSCAN_DESCRIPTOR desc;
         DWORD returned = 0;
-        USBSCAN_TIMEOUT to;
 
         sprintf_s(name, sizeof name, "\\\\.\\Usbscan%d", index);
         f = CreateFileA(name, GENERIC_READ | GENERIC_WRITE,
                         FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+                        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED, NULL);
         if (f == INVALID_HANDLE_VALUE) continue;
 
         memset(&desc, 0, sizeof desc);
@@ -126,10 +169,13 @@ static Transport *open_usbscan(void)
             CloseHandle(f);
             continue;
         }
-        to.TimeoutRead = 30000;
-        to.TimeoutWrite = 30000;
-        to.TimeoutEvent = 30000;
-        DeviceIoControl(f, USBSCAN_TIMEOUT_IOCTL, &to, sizeof to, NULL, 0, &returned, NULL);
+        /*
+         * Deliberately no IOCTL_SET_TIMEOUT: on this device any non-zero
+         * TimeoutRead makes usbscan.sys abort every transfer with
+         * ERROR_OPERATION_ABORTED (995). Timeouts are enforced in user mode
+         * with WaitForSingleObject + CancelIoEx instead.
+         */
+        recover_usbscan(f);
 
         {
             Transport *t = (Transport *)calloc(1, sizeof *t);
@@ -292,32 +338,35 @@ void transport_close(Transport *t)
     free(t);
 }
 
+/*
+ * CancelIoEx halts the usbscan endpoint, so after a timeout every later
+ * transfer fails instantly with ERROR_GEN_FAILURE (31) until the pipe is
+ * reset. Reset it here, and only here: one dead transfer must not poison the
+ * rest of the session.
+ */
+static void usbscan_reset_pipes(HANDLE f)
+{
+    int pipe;
+    DWORD returned;
+
+    for (pipe = PIPE_READ; pipe <= PIPE_WRITE; pipe++)
+        DeviceIoControl(f, IOCTL_USBSCAN_RESET_PIPE, &pipe, sizeof pipe,
+                        NULL, 0, &returned, NULL);
+}
+
 static int sync_io(Transport *t, BOOL write, BYTE *data, DWORD *len, DWORD timeoutMs)
 {
     OVERLAPPED ov;
     BOOL ok;
     DWORD done = 0;
 
-    if (t->viaUsbscan) {
-        if (write) {
-            ok = WriteFile(t->file, data, *len, &done, NULL);
-        } else {
-            ok = ReadFile(t->file, data, *len, &done, NULL);
-        }
-        if (!ok) {
-            LOGF("usbscan: %s failed err %lu (done %lu)\n",
-                 write ? "write" : "read", GetLastError(), done);
-            return 0;
-        }
-        *len = done;
-        return 1;
-    }
-    (void)timeoutMs;
-
     memset(&ov, 0, sizeof ov);
     ov.hEvent = CreateEventA(NULL, TRUE, FALSE, NULL);
     if (!ov.hEvent) return 0;
-    if (write) {
+    if (t->viaUsbscan) {
+        ok = write ? WriteFile(t->file, data, *len, &done, &ov)
+                   : ReadFile(t->file, data, *len, &done, &ov);
+    } else if (write) {
         ULONG to = timeoutMs;
         WinUsb_SetPipePolicy(t->winusb, t->pipeOut, PIPE_TRANSFER_TIMEOUT, sizeof to, &to);
         ok = WinUsb_WritePipe(t->winusb, t->pipeOut, data, *len, &done, &ov);
@@ -327,14 +376,45 @@ static int sync_io(Transport *t, BOOL write, BYTE *data, DWORD *len, DWORD timeo
         ok = WinUsb_ReadPipe(t->winusb, t->pipeIn, data, *len, &done, &ov);
     }
     if (!ok) {
-        if (GetLastError() == ERROR_IO_PENDING) {
-            DWORD wait = WaitForSingleObject(ov.hEvent, timeoutMs + 1000);
-            if (wait == WAIT_OBJECT_0 && GetOverlappedResult(t->file, &ov, &done, FALSE)) ok = TRUE;
+        DWORD err = GetLastError();
+        if (err == ERROR_IO_PENDING) {
+            if (WaitForSingleObject(ov.hEvent, timeoutMs) == WAIT_OBJECT_0) {
+                ok = GetOverlappedResult(t->file, &ov, &done, FALSE);
+            } else {
+                /* a transfer left pending blocks every later one */
+                CancelIoEx(t->file, &ov);
+                WaitForSingleObject(ov.hEvent, 1000);
+                LOGF("%s: %s timed out after %lu ms\n",
+                     t->viaUsbscan ? "usbscan" : "winusb",
+                     write ? "write" : "read", timeoutMs);
+                CloseHandle(ov.hEvent);
+                if (t->viaUsbscan) usbscan_reset_pipes(t->file);
+                return 0;
+            }
+        } else if (t->viaUsbscan && err == ERROR_GEN_FAILURE) {
+            /* endpoint left halted by an earlier cancel */
+            usbscan_reset_pipes(t->file);
+            ok = write ? WriteFile(t->file, data, *len, &done, &ov)
+                       : ReadFile(t->file, data, *len, &done, &ov);
+            err = GetLastError();
+            if (!ok && err == ERROR_IO_PENDING) {
+                if (WaitForSingleObject(ov.hEvent, timeoutMs) == WAIT_OBJECT_0)
+                    ok = GetOverlappedResult(t->file, &ov, &done, FALSE);
+                else {
+                    CancelIoEx(t->file, &ov);
+                    WaitForSingleObject(ov.hEvent, 1000);
+                    CloseHandle(ov.hEvent);
+                    return 0;
+                }
+            }
         }
     }
     if (!ok) {
-        LOGF("winusb: %s failed err %lu (done %lu)\n", write ? "write" : "read", GetLastError(), done);
+        LOGF("%s: %s failed err %lu (done %lu)\n",
+             t->viaUsbscan ? "usbscan" : "winusb",
+             write ? "write" : "read", GetLastError(), done);
         CloseHandle(ov.hEvent);
+        if (t->viaUsbscan) usbscan_reset_pipes(t->file);
         return 0;
     }
     CloseHandle(ov.hEvent);
@@ -419,10 +499,10 @@ static void mock_reply_inquiry(void)
     buf[0] = 0x06;
     memcpy(buf + 8, "FUJITSU ", 8);
     memcpy(buf + 16, "ScanSnap iX1300 ", 16);
-    memcpy(buf + 32, "1.50", 4);
+    memcpy(buf + 32, "0M00", 4);         /* what the real unit reports */
     buf[0x2D] = 0x01;
     buf[0x2B] = 0x00; buf[0x2A] = 0x00;
-    buf[0x2E] = 0x00; buf[0x2F] = 0x02;
+    buf[0x2E] = 0x00; buf[0x2F] = 0x00;  /* duplex offset reads 0 on the unit */
     mock_push(buf, sizeof buf);
     mock_queue_status(0);
 }
