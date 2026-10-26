@@ -63,6 +63,44 @@ which also works when the WDK (and therefore `inf2cat.exe`) is not installed.
 *Scan > New Profile*, **Driver: TWAIN**, **Device: ScanSnap iX1300**.
 Paper source Auto/Feeder/Duplex, colour/gray/black-and-white, 150-600 dpi.
 
+The paper path follows the scanner's sensors at the start of each batch:
+sheets in the U-turn ADF are scanned from there; a sheet in the front
+**Return Scan** slot is scanned through the return path when the ADF is
+empty. With nothing loaded the driver shows "No paper is loaded" and NAPS2
+adds no error of its own.
+
+## Scan button
+
+`build\ScanSnapButton.exe` starts a NAPS2 scan when the scanner's **Scan**
+button is pressed. It needs no admin rights:
+
+```
+build\ScanSnapButton.exe --install
+```
+
+copies itself to `%LOCALAPPDATA%\ScanSnap-iX1300`, writes
+`ScanSnapButton.ini` there, adds a logon entry (`HKCU\...\Run`) and starts.
+`--stop` stops it, `--uninstall` stops it and removes the logon entry.
+
+On a press it runs NAPS2's own scanner-button entry,
+`NAPS2.exe "/StiDevice:ScanSnap iX1300"`. If NAPS2 is open, that window
+scans and adds the pages; otherwise NAPS2 starts and scans. NAPS2 uses its
+default profile when that profile's device is the ScanSnap iX1300, else the
+first profile that is; with none it asks for one. Nothing is saved
+automatically - save from NAPS2 as usual. Settings, re-read on every press:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `Naps2` | `%ProgramW6432%\NAPS2\NAPS2.exe` | |
+| `Device` | `ScanSnap iX1300` | NAPS2's device id (the TWAIN source name) |
+| `LogEnable` / `LogFile` | 0 / `%TEMP%\ScanSnapButton.log` | |
+
+The scanner has no button event, so the watcher keeps the device open and
+polls its status every 200 ms, as ScanSnap Home does. WinUSB allows one open
+handle: the data source and `probe` ask the watcher to let go
+(`transport_request_device`, two named events) and it stays off the device
+for 5 s after each hand-over, retrying every 2 s while someone else holds it.
+
 ## Configuration
 
 `C:\Windows\twain_32\ScanSnapTWAIN.ini`:
@@ -96,10 +134,11 @@ src/session.c      batch/page state machine
 src/image.c        sample conversion (inversion, de-interleave) + DIB/BMP
 src/ds.c           TWAIN data source
 src/misc.c         config and logging
+src/button.c       Scan-button watcher (ScanSnapButton.exe)
 tools/selftest.c   protocol test, scripted transport
 tools/run-dsmtest.ps1  run the DSM test without admin rights
 tools/mockscan.c   full session test, synthetic device
-tools/probe.c      hardware probe
+tools/probe.c      hardware probe: probe info|status|scan
 install/           INF, scripts, default ini
 docs/PROTOCOL.md   the reverse-engineered protocol
 docs/VERIFICATION.md  what was proven, and how

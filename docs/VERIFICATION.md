@@ -1,8 +1,8 @@
 # Verification
 
 Every level below was run; the command that proves it is named. Levels 1-4 need
-no hardware. Level 5 is the hardware session, which reached the scanner but not
-yet a full scan - see the end of section 5.
+no hardware. Level 5 is the hardware session: full simplex pages through
+`probe`, and the NAPS2 defects they exposed - see section 5.
 
 ## 1. Build
 
@@ -30,8 +30,10 @@ build\selftest.exe
 Replays the iX1600 front/grayscale command stream (the profile the iX1300
 reproduces byte for byte) and checks INQUIRY/VPD parsing, the arm sequence,
 hopper decoding, feed + TEST UNIT READY, SCAN, pixel-size READ,
-read-image-count, image READ, ILI short-read trimming, status resynchronisation
-after a short data-in, and the `03/80/03` end-of-batch sense. 23 assertions.
+read-image-count, image READ, ILI/EOM short-read trimming and flags, a
+`03/80/13` READ whose filler data phase must be discarded, status
+resynchronisation after a short data-in, and the `03/80/03` end-of-batch
+sense. 28 assertions.
 
 ## 3. Session, synthetic device
 
@@ -42,9 +44,15 @@ build\mockscan.exe [outdir]
 A self-answering fake iX1300 walks the whole batch state machine for colour
 300 dpi, gray 200 dpi, line art 300 dpi, colour 150 dpi duplex and colour
 **600 dpi** (5100x8400, 128 MB per page, which covers the unrestricted-size
-path): geometry, row width per bit depth, TWAIN pixel type, page counts and
-clean termination. With `outdir` it writes BMPs; those were inspected for polarity
-and row order.
+path). The fake answers READ the way the real unit does (`build\duplex.log`):
+separate front and back streams, `03/80/13` with a full filler data phase on
+every third READ and whenever a duplex side runs more than 1 MB ahead of the
+other, a pixel height longer than the sheet, and EOM + ILI on the last block.
+Every page is compared byte for byte with the wire pattern of its side after
+inversion and the 180-degree turn, plus height, side order, page counts and
+clean termination. 66 assertions. Putting back any one of the three hardware
+bugs below (no rotation, filler counted as image, front read before back)
+makes it fail.
 
 ## 4. TWAIN, three ways
 
@@ -57,8 +65,11 @@ build\twaintest.exe build\ScanSnap-iX1300.ds   # direct load, Mock=1
 `TwainScanRunner.ConfigureSource` (XFERMECH=memory, INDICATORS=false,
 FEEDERENABLED, DUPLEXENABLED, AUTOMATICSENSEMEDIUM, PIXELTYPE, BITDEPTH,
 UNITS, XRES/YRES, BRIGHTNESS, CONTRAST), then ENABLEDS, the
-XFERREADY/IMAGEINFO/IMAGEMEMXFER/ENDXFER loop, DISABLEDS, CLOSEDS. 134
-assertions, 0 failures. Native DIB and BMP file transfer are covered too:
+XFERREADY/IMAGEINFO/IMAGEMEMXFER/ENDXFER loop, DISABLEDS, CLOSEDS. Each
+memory strip must hold whole rows (`BytesWritten == Rows * BytesPerRow`) at
+the running `YOffset`, and the strips must cover `ImageLength`, which is how
+NAPS2 places them. 203 assertions, 0 failures; the old DS fails 20 of them.
+Native DIB and BMP file transfer are covered too:
 `NATIVEXFER` returns a real `BITMAPINFOHEADER` (biSize 40, 24 bpp, 2550 px
 wide) and `IMAGEFILEXFER` writes a valid BMP.
 
@@ -219,29 +230,107 @@ Four more were found by driving the scanner from NAPS2:
    sense data that `do_cmd` then fetched again, leaving the mock one packet out
    of step for every later command.
 
+### What real scans through NAPS2 exposed
+
+Once paper fed, `probe scan` produced clean pages (`build\simplex.log`: every
+READ full, the last one `eom 1 ili 1`, then `03/80/03`), but NAPS2 pages were
+cut into horizontal bands and duplex sides were mostly solid gray. Three
+defects, all fixed:
+
+8. **Memory-transfer strips split rows.** `memory_xfer` filled the whole
+   262144-byte buffer, which is not a whole number of rows (7650 bytes at
+   300 dpi colour), reported `Rows = floor(bytes / BytesPerRow)` and advanced
+   by the full buffer. NAPS2 places `Rows` rows at `YOffset`, so every strip
+   after the first started mid-row: bands every 34.25 rows at 300 dpi (68.5 at
+   150), each shifted sideways, with R/G/B rotated when the offset was not a
+   multiple of 3. The probe path never used it, so its BMPs were fine. Strips
+   now carry whole rows.
+9. **"No image data yet" was counted as image.** In duplex about half of all
+   READs answer `03/80/13`, and the unit still sends a full data phase of
+   filler first. `read_side` added those bytes to the page, so a "page" was
+   complete long before the sheet had passed (`build\duplex.log`: 32 real
+   front blocks, 92 filler blocks in 0.3 s). `proto_read_image` now returns 0
+   bytes for `03/80/13` and busy, as SANE does (`DEVICE_BUSY`, block dropped).
+10. **Duplex read the whole front before the back.** The unit buffers both
+    sides and stalls the one read too far ahead. Sides are now read
+    alternately one block at a time, and a side ends when end of medium has
+    been seen and its last READ was short - SANE's `DUPLEX_INTERLACE_ALT`
+    rule, which is SANE's default for this generation.
+
+Every NAPS2 page also came out rotated 180 degrees (not mirrored), front and
+back, with the sheet loaded as the manual says. `page_from_raw` now turns
+pages around.
+
+### Paper path, empty feeder and the Scan button
+
+`probe status` with each input loaded in turn gave byte 3 = `80` (nothing),
+`00` (ADF), `81` (front slot), `01` (both); a Scan press set byte 4 bit 0 for
+one 100 ms sample, a 3 s hold the same (PROTOCOL.md 3a/3b).
+
+With the sensors read at batch start (`probe scan`, no options):
+
+| Loaded | Log | Result |
+|---|---|---|
+| front slot | `build\auto_front.log` | `paper sensors front slot`, return path, 1 page 2550x3320, EOM+ILI end, `03/80/03` |
+| 2 sheets ADF | `build\auto_adf.log` | ADF path, 2 pages 2550x3308/3307, `03/80/03` |
+| nothing | `build\empty.log` (before the no-feed change) | feed answered `03/80/03`, rc 3 |
+
+Earlier the NAPS2 run at 18:35:56 got `03/80/01` (jam) for a feed with
+nothing in the ADF; the driver now refuses an empty batch before feeding.
+
+The WinUSB open used to leave stale data-in queued: after a rejected
+`08 … 01` paper query every command read the previous answer. The open now
+drains the IN pipe (it discarded 244 bytes once, nothing on a clean open).
+
+Watcher hand-off (`build\button.log`, `build\handoff.log`): the watcher opened
+the unit, `probe info` asked for it and got it in the same millisecond, ran,
+and the watcher reopened 5 s later.
+
+Through NAPS2 with the installed DS (SHA-256 `B4A71813…275651`), duplex
+300 dpi colour profile:
+
+- nothing loaded: the "No paper is loaded" box, no motor, no NAPS2 error;
+  the log holds only `paper sensors empty` (22:31:39).
+- one sheet in the front slot: `paper sensors front slot`, both sides read
+  alternately with `03/80/13` discarded, end on `03/80/03`; `test3.pdf` has 2
+  pages of 2550x3300, both with content (22:32:41).
+
+Scan button (`ScanSnapButton.exe`, installed with `--install`): presses at
+22:45:45 (NAPS2 open) and 22:45:58 (NAPS2 closed) each ran
+`NAPS2.exe "/StiDevice:ScanSnap iX1300"`; the open window scanned and added
+the pages, and with NAPS2 closed it started and scanned.
+
+### Confirmed through NAPS2 on the unit
+
+With the rebuilt DS installed, three NAPS2 batches at 300 dpi colour, Letter
+(duplex 1 sheet, simplex 1 sheet, duplex 2 sheets) gave 2, 1 and 4 pages,
+each batch ending on `03/80/03`. The protocol log shows front and back READs
+alternating, 98 full READs per side (3300 lines), and all 301 `03/80/13`
+answers recorded as `got 0`. In the delivered pages the image breaks no longer
+fall on the 262144-byte strip grid, no row is filler gray, and every page with
+content matches the raw probe scan turned 180 degrees.
+
 ### Still open on hardware
 
-A complete page: feed, SCAN, image READ and duplex. The feed currently
-answers `03/80/03` with paper in the U-turn ADF and `err = 0`, and no software
-sequence changes it (`CANCEL`, `halt`, lamp-on, three feeds). Two
-explanations remain, both external to the driver:
+A short sheet in **duplex** - EOM + ILI ending one side of the alternating
+read loop early - has only run on the synthetic device; the simplex case has
+run on the unit (table above).
 
-- the sheet is in the front **Return Scan** slot, which the driver does not
-  drive (`feedFromBack = 0`), or
-- the unit is latched after the interrupted scan and wants a power cycle.
+Line art, gray and 600 dpi have run through NAPS2 only on the old DS, with
+the strip defect.
 
-Duplex is also untested: this unit's VPD reports `duplexOffset = 0` even
-though the hardware is duplex (two CIS, 60 ipm), so `0x2e/0x2f` is not the
-field the iX1600 profile puts there. Nothing gates on it - `CAP_DUPLEX` is
-answered unconditionally - but the real bit is unidentified.
+This unit's VPD reports `duplexOffset = 0` even though the hardware is duplex
+(two CIS, 60 ipm), so `0x2e/0x2f` is not the field the iX1600 profile puts
+there. Nothing gates on it - `CAP_DUPLEX` is answered unconditionally - but
+the real bit is unidentified.
 
 ## 6. Install state
 
-Installed, all verified from this session:
+Installed and verified:
 
 | Step | Result |
 |---|---|
-| `C:\Windows\twain_32\ScanSnap-iX1300.ds` | byte-identical to `build\` (all fixes) |
+| `C:\Windows\twain_32\ScanSnap-iX1300.ds` | current build (SHA-256 `C3B978C5...`), with the strip, read-loop and rotation fixes |
 | `HKLM\SOFTWARE\WOW6432Node\TWAIN\DataSources` | `ScanSnap-iX1300` = the .ds path |
 | Driver package | `oem31.inf` published, device assigned to it |
 | Catalog | SHA-256, signed, `signtool verify /pa` clean |
@@ -302,9 +391,9 @@ INF's SHA-256 is not inside the existing `.cat`. And `pnputil` exit codes 3010
 (reboot required) and 259 (already installed) are treated as success instead of
 warning.
 
-What is **not** yet proven on hardware is a complete scan (feed, SCAN, image
-READ, duplex), because the unit is wedged; that needs the power cycle above,
-then `probe.exe scan out`.
+Simplex and duplex colour scans through NAPS2 are proven on hardware with the
+current DS (section 5); a sheet shorter than the window, and the other modes
+on the current DS, are the remaining gaps.
 
 `dsmtest` proves discovery, `OPENDS`, capabilities, transfer and close through
 NAPS2's real `twaindsm.dll`, so the TWAIN path itself does not depend on any of

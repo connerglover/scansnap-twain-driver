@@ -74,6 +74,17 @@ int  transport_bulk_out(Transport *t, const BYTE *data, DWORD len, DWORD timeout
 int  transport_bulk_in(Transport *t, BYTE *data, DWORD *len, DWORD timeoutMs);
 const char *transport_kind(const Transport *t);
 
+/*
+ * Scan-button watcher hand-off (src/button.c). WinUSB allows one open handle,
+ * and the watcher keeps the scanner open to poll its button. Anything else
+ * calls transport_request_device() before transport_open(): when a watcher
+ * is running it closes its handle, signals RELEASED, and stays off the device
+ * for a few seconds. Without a watcher the call returns at once.
+ */
+#define SSDRV_BUTTON_RELEASE  "Local\\ScanSnapIX1300.ButtonRelease"
+#define SSDRV_BUTTON_RELEASED "Local\\ScanSnapIX1300.ButtonReleased"
+void transport_request_device(void);
+
 /* Opens a scripted/mock transport used by tools/selftest and g_cfg.mock. */
 Transport *transport_open_mock(void);
 Transport *transport_open_mock_synthetic(void);
@@ -91,6 +102,9 @@ enum {
     PROTO_ERROR,
     PROTO_IO
 };
+
+/* proto_read_image *flags */
+enum { PROTO_READ_ILI = 1, PROTO_READ_EOM = 2 };
 
 enum { COMP_LINEART = 0, COMP_HALFTONE = 1, COMP_GRAY = 2, COMP_COLOR = 5 };
 
@@ -117,6 +131,7 @@ typedef struct {
     int  basicXRes, basicYRes, maxXRes, maxYRes;
     LONG maxWidthUnits, maxLengthUnits;     /* 1/1200 inch */
     int  hasAdf, hasFlatbed, hasColor, hasGray, hasLineart, hasDuplex;
+    int  hasReturnPath;    /* VPD 0x7c bit 7 */
     int  stdRes[16];
     int  stdResCount;
     int  colorOffset, duplexOffset;
@@ -141,9 +156,9 @@ int  proto_feed(Proto *p);                    /* OBJECT POSITION feed + TUR */
 int  proto_start_scan(Proto *p);              /* SCAN */
 int  proto_pixel_size(Proto *p, int back, LONG *w, LONG *h);
 int  proto_wait_image(Proto *p, int back, LONG bytes, int attempts);  /* f1/0x10 poll */
-int  proto_read_image(Proto *p, int back, BYTE *buf, DWORD want, DWORD *got);
+int  proto_read_image(Proto *p, int back, BYTE *buf, DWORD want, DWORD *got, int *flags);
 int  proto_end(Proto *p);                     /* cancel + buffering off */
-int  proto_hw_status(Proto *p, BYTE out[12], DWORD *got);
+int  proto_hw_status(Proto *p, BYTE *out, DWORD len, DWORD *got);  /* C2 */
 int  proto_hopper_has_paper(Proto *p);
 int  proto_test_unit_ready(Proto *p);          /* one plain TUR round trip */
 int  proto_scanner_control(Proto *p, int function);  /* f1: 0 ADF, 4 cancel, 5 lamp */
@@ -154,6 +169,9 @@ void  mock_push(const BYTE *data, DWORD len);
 void  mock_push_status(BYTE statusByte);
 void  mock_reset(void);
 DWORD mock_pending(void);
+const BYTE *mock_sent_cdb(DWORD index);   /* command block `index` since mock_reset, or NULL */
+DWORD mock_sent_cdb_count(void);
+BYTE  mock_pattern(int side, DWORD line, DWORD off, DWORD bpl);  /* synthetic wire bytes */
 
 /* ---------------------------------------------------------------- session */
 

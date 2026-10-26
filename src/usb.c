@@ -44,13 +44,23 @@ typedef struct {
 static MockChunk g_mockQueue[MOCK_MAX_CHUNKS];
 static int g_mockHead, g_mockTail, g_mockCount;
 
+/* Command blocks received since mock_reset, so tests can check what was sent. */
+#define MOCK_MAX_CDBS 64
+static BYTE  g_mockCdbs[MOCK_MAX_CDBS][12];
+static DWORD g_mockCdbCount;
+
 /* State of the synthetic device (transport_open_mock_synthetic). */
-static int  g_mockSheet, g_mockImageLeft, g_mockLines;
+static int  g_mockSheet, g_mockLines;
+static int  g_mockLeft[2];       /* image bytes still to send, front/back */
+static int  g_mockSent[2];       /* image bytes sent this sheet, front/back */
+static int  g_mockDuplex;        /* SET WINDOW carried two descriptors */
+static int  g_mockReads;         /* READ counter, for the no-data cadence */
 static LONG g_mockPixelsWide;
 static BYTE g_mockLastOp;
 static BYTE g_mockDesired;   /* composition of the pending image */
 static int  g_mockSensePending;   /* next REQUEST SENSE reports a condition */
-static BYTE g_mockSenseKey, g_mockSenseAsc, g_mockSenseAscq;
+static BYTE g_mockSenseKey, g_mockSenseAsc, g_mockSenseAscq, g_mockSenseFlags;
+static DWORD g_mockSenseInfo;
 
 static Transport *mock_open(int synthetic)
 {
@@ -60,7 +70,10 @@ static Transport *mock_open(int synthetic)
     t->mockSynthetic = synthetic;
     if (synthetic) {
         g_mockSheet = 0;
-        g_mockImageLeft = 0;
+        g_mockLeft[0] = g_mockLeft[1] = 0;
+        g_mockSent[0] = g_mockSent[1] = 0;
+        g_mockDuplex = 0;
+        g_mockReads = 0;
         g_mockLastOp = 0;
         g_mockDesired = 5;
         g_mockPixelsWide = 2550;
@@ -201,6 +214,31 @@ static Transport *open_usbscan(void)
     return NULL;
 }
 
+/*
+ * WinUSB counterpart of recover_usbscan: a previous session that died, or a
+ * command the unit answered with more data than was read, leaves data-in
+ * queued, and every later command then reads the previous command's answer.
+ * Abort, drain the IN pipe until it stays empty for 200 ms, then reset both.
+ */
+static void recover_winusb(WINUSB_INTERFACE_HANDLE wu, UCHAR in, UCHAR out)
+{
+    ULONG shortWait = 200, normal = 30000;
+    int round;
+
+    WinUsb_AbortPipe(wu, in);
+    WinUsb_AbortPipe(wu, out);
+    WinUsb_SetPipePolicy(wu, in, PIPE_TRANSFER_TIMEOUT, sizeof shortWait, &shortWait);
+    for (round = 0; round < 256; round++) {
+        BYTE buf[16384];
+        ULONG done = 0;
+        if (!WinUsb_ReadPipe(wu, in, buf, sizeof buf, &done, NULL) || !done) break;
+        LOGF("winusb: discarded %lu stale bytes\n", done);
+    }
+    WinUsb_SetPipePolicy(wu, in, PIPE_TRANSFER_TIMEOUT, sizeof normal, &normal);
+    WinUsb_ResetPipe(wu, in);
+    WinUsb_ResetPipe(wu, out);
+}
+
 /* ------------------------------------------------------------------ open */
 
 typedef struct {
@@ -260,6 +298,7 @@ static BOOL inspect_path(const char *path, Candidate *c)
         WinUsb_SetPipePolicy(wu, c->in, AUTO_CLEAR_STALL, sizeof(ULONG), &(ULONG){1});
         WinUsb_SetPipePolicy(wu, c->out, AUTO_CLEAR_STALL, sizeof(ULONG), &(ULONG){1});
     }
+    recover_winusb(wu, c->in, c->out);
     c->file = f;
     c->winusb = wu;
     ok = TRUE;
@@ -269,6 +308,23 @@ done:
         CloseHandle(f);
     }
     return ok;
+}
+
+void transport_request_device(void)
+{
+    HANDLE release = OpenEventA(EVENT_MODIFY_STATE, FALSE, SSDRV_BUTTON_RELEASE);
+    HANDLE released;
+    DWORD w;
+
+    if (!release) return;                       /* no watcher running */
+    released = OpenEventA(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, SSDRV_BUTTON_RELEASED);
+    if (!released) { CloseHandle(release); return; }
+    ResetEvent(released);
+    SetEvent(release);
+    w = WaitForSingleObject(released, 3000);
+    LOGF("usb: button watcher %s the device\n", w == WAIT_OBJECT_0 ? "released" : "did not release");
+    CloseHandle(released);
+    CloseHandle(release);
 }
 
 Transport *transport_open(char *ppath, size_t pathLen)
@@ -466,6 +522,17 @@ void mock_push_status(BYTE statusByte)
 void mock_reset(void)
 {
     g_mockHead = g_mockTail = g_mockCount = 0;
+    g_mockCdbCount = 0;
+}
+
+const BYTE *mock_sent_cdb(DWORD index)
+{
+    return index < g_mockCdbCount ? g_mockCdbs[index] : NULL;
+}
+
+DWORD mock_sent_cdb_count(void)
+{
+    return g_mockCdbCount;
 }
 
 DWORD mock_pending(void)
@@ -537,58 +604,103 @@ static void mock_reply_vpd(void)
     mock_queue_status(0);
 }
 
+/*
+ * The unit reports the window length as the pixel height (4200 lines for a
+ * 14" window at 300 dpi) and ends the real sheet early with EOM + ILI, so
+ * the synthetic one does too: a quarter more lines than it will send.
+ */
 static void mock_reply_pixel_size(int back)
 {
     BYTE sz[0x20];
+    int lines = g_mockLines + g_mockLines / 4;
     memset(sz, 0, sizeof sz);
     sz[0] = (BYTE)(g_mockPixelsWide >> 24);
     sz[1] = (BYTE)(g_mockPixelsWide >> 16);
     sz[2] = (BYTE)(g_mockPixelsWide >> 8);
     sz[3] = (BYTE)g_mockPixelsWide;
-    sz[4] = (BYTE)(g_mockLines >> 24);
-    sz[5] = (BYTE)(g_mockLines >> 16);
-    sz[6] = (BYTE)(g_mockLines >> 8);
-    sz[7] = (BYTE)g_mockLines;
+    sz[4] = (BYTE)(lines >> 24);
+    sz[5] = (BYTE)(lines >> 16);
+    sz[6] = (BYTE)(lines >> 8);
+    sz[7] = (BYTE)lines;
     mock_push(sz, sizeof sz);
     mock_queue_status(0);
     (void)back;
 }
 
-/* Deterministic test pattern: a dark wedge on a light background plus a
- * marker stripe, so orientation and polarity are visible in the BMP. */
-static DWORD mock_image_chunk(BYTE *out, DWORD want)
+static DWORD mock_bpl(void)
 {
-    DWORD bpl;
-    DWORD line, off, i;
-    if (g_mockImageLeft <= 0) return 0;
-    if ((DWORD)g_mockImageLeft < want) want = (DWORD)g_mockImageLeft;
-    bpl = g_mockDesired == 5 ? (DWORD)g_mockPixelsWide * 3
-        : g_mockDesired == 2 ? (DWORD)g_mockPixelsWide
-        : (DWORD)((g_mockPixelsWide + 7) / 8);
+    return g_mockDesired == 5 ? (DWORD)g_mockPixelsWide * 3
+         : g_mockDesired == 2 ? (DWORD)g_mockPixelsWide
+         : (DWORD)((g_mockPixelsWide + 7) / 8);
+}
+
+/* Wire byte at (line, off) of one side; tools/mockscan.c checks pages
+ * against the same formula. */
+BYTE mock_pattern(int side, DWORD line, DWORD off, DWORD bpl)
+{
+    /* The scanner sends inverted samples: paper white is 0x00 on the wire,
+     * ink is 0xFF. 1-bit line art uses 1 = ink. */
+    if (line < 8) return 0xFF;                      /* ink stripe at top */
+    if (off < bpl / 3) return 0x00;                 /* white paper */
+    return (BYTE)(0x10 + (line * 7 + off * 3 + (DWORD)side * 0x20) % 0x60);
+}
+
+/* Next image bytes of one side; returns how many (0 once the side is sent). */
+static DWORD mock_image_chunk(int side, BYTE *out, DWORD want)
+{
+    DWORD bpl = mock_bpl(), i;
+    if (g_mockLeft[side] <= 0) return 0;
+    if ((DWORD)g_mockLeft[side] < want) want = (DWORD)g_mockLeft[side];
     for (i = 0; i < want; i++) {
-        DWORD abs = (DWORD)((size_t)g_mockLines * bpl - (size_t)g_mockImageLeft + i);
-        line = abs / bpl;
-        off = abs % bpl;
-        /* The scanner sends inverted samples: paper white is 0x00 on the wire,
-         * ink is 0xFF. 1-bit line art uses 1 = ink. */
-        if (line < 8) out[i] = 0xFF;                      /* ink stripe at top */
-        else if (off < bpl / 3) out[i] = 0x00;            /* white paper */
-        else out[i] = (BYTE)(0x10 + (line * 7 + off * 3) % 0x60);
+        DWORD abs = (DWORD)g_mockSent[side] + i;
+        out[i] = mock_pattern(side, abs / bpl, abs % bpl, bpl);
     }
-    g_mockImageLeft -= (int)want;
+    g_mockLeft[side] -= (int)want;
+    g_mockSent[side] += (int)want;
     return want;
 }
 
-static void mock_reply_read(int windowBack, DWORD want)
+/* CHECK CONDITION; do_cmd's REQUEST SENSE then reports this. */
+static void mock_check(BYTE key, BYTE asc, BYTE ascq, BYTE flags, DWORD info)
 {
-    BYTE *buf = (BYTE *)malloc(want ? want : 1);
+    mock_queue_status(1);
+    g_mockSensePending = 1;
+    g_mockSenseKey = key;
+    g_mockSenseAsc = asc;
+    g_mockSenseAscq = ascq;
+    g_mockSenseFlags = flags;
+    g_mockSenseInfo = info;
+}
+
+/*
+ * READ of image data, the way the iX1300 answers it (build/duplex.log):
+ * - "no image data yet" still runs a full data phase of filler, then
+ *   CHECK CONDITION 03/80/13. Every third READ gets that, and in duplex a
+ *   side more than 1 MB ahead of the other always does - the unit buffers
+ *   both sides and stalls the one being read too far ahead.
+ * - the last block of a side is padded to the requested length and flagged
+ *   EOM + ILI with the residue in the sense information field.
+ */
+static void mock_reply_read(int side, DWORD want)
+{
+    BYTE *buf = (BYTE *)calloc(want ? want : 1, 1);
     DWORD n;
+    int other = !side;
+
     if (!buf) { mock_queue_status(8); return; }
-    n = mock_image_chunk(buf, want);
-    if (n) mock_push(buf, n);
+    if (++g_mockReads % 3 == 0 ||
+        (g_mockDuplex && g_mockLeft[other] > 0 && g_mockSent[side] - g_mockSent[other] > 1024 * 1024)) {
+        memset(buf, 0x56, want);
+        mock_push(buf, want);
+        free(buf);
+        mock_check(0x03, 0x80, 0x13, 0, 0);
+        return;
+    }
+    n = mock_image_chunk(side, buf, want);
+    mock_push(buf, want);
     free(buf);
-    mock_queue_status(0);
-    (void)windowBack;
+    if (n < want) mock_check(0x00, 0x00, 0x00, 0x60, want - n);   /* EOM | ILI */
+    else mock_queue_status(0);
 }
 
 static void mock_handle_command(const BYTE *env)
@@ -603,7 +715,12 @@ static void mock_handle_command(const BYTE *env)
         memset(sense, 0, sizeof sense);
         sense[0] = 0x70;
         if (g_mockSensePending) {
-            sense[2] = g_mockSenseKey;
+            DWORD info = g_mockSenseInfo;
+            sense[2] = (BYTE)(g_mockSenseKey | g_mockSenseFlags);
+            sense[3] = (BYTE)(info >> 24);
+            sense[4] = (BYTE)(info >> 16);
+            sense[5] = (BYTE)(info >> 8);
+            sense[6] = (BYTE)info;
             sense[12] = g_mockSenseAsc;
             sense[13] = g_mockSenseAscq;
             g_mockSensePending = 0;
@@ -624,7 +741,7 @@ static void mock_handle_command(const BYTE *env)
     case 0xF1:
         if ((cdb[1] & 0x0F) == 0x04) {      /* cancel closes the batch */
             g_mockSheet = 0;
-            g_mockImageLeft = 0;
+            g_mockLeft[0] = g_mockLeft[1] = 0;
         }
         mock_queue_status(0);
         break;
@@ -636,18 +753,13 @@ static void mock_handle_command(const BYTE *env)
                  * REQUEST SENSE, so pushing sense data here would leave it
                  * queued and desync every later command.
                  */
-                mock_queue_status(1);
-                g_mockSensePending = 1;
-                g_mockSenseKey = 0x03;
-                g_mockSenseAsc = 0x80;
-                g_mockSenseAscq = 0x03;      /* hopper empty / no documents */
+                mock_check(0x03, 0x80, 0x03, 0, 0);   /* hopper empty / no documents */
                 break;
             }
             g_mockSheet++;
-            g_mockImageLeft = (int)((size_t)g_mockLines *
-                                    (g_mockDesired == 5 ? (size_t)g_mockPixelsWide * 3
-                                     : g_mockDesired == 2 ? (size_t)g_mockPixelsWide
-                                     : (size_t)((g_mockPixelsWide + 7) / 8)));
+            g_mockLeft[0] = (int)((size_t)g_mockLines * mock_bpl());
+            g_mockLeft[1] = g_mockDuplex ? g_mockLeft[0] : 0;
+            g_mockSent[0] = g_mockSent[1] = 0;
         }
         mock_queue_status(0);
     } break;
@@ -660,7 +772,7 @@ static void mock_handle_command(const BYTE *env)
     } break;
     case 0x28:
         if (cdb[2] == 0x80) mock_reply_pixel_size(cdb[5] & 0x80);
-        else mock_reply_read(cdb[5] & 0x80,
+        else mock_reply_read((cdb[5] & 0x80) ? 1 : 0,
                              ((DWORD)cdb[6] << 16) | ((DWORD)cdb[7] << 8) | cdb[8]);
         break;
     default:
@@ -673,6 +785,8 @@ int transport_bulk_out(Transport *t, const BYTE *data, DWORD len, DWORD timeoutM
 {
     DWORD n = len;
     if (t->isMock) {
+        if (len == 31 && data[0] == 0x43 && g_mockCdbCount < MOCK_MAX_CDBS)
+            memcpy(g_mockCdbs[g_mockCdbCount++], data + 0x13, 12);
         if (!t->mockSynthetic) return 1;
         if (len == 31 && data[0] == 0x43) {
             mock_handle_command(data);
@@ -689,6 +803,7 @@ int transport_bulk_out(Transport *t, const BYTE *data, DWORD len, DWORD timeoutM
             g_mockLines = lenUnits * resX / 1200;
             if (g_mockPixelsWide < 8) g_mockPixelsWide = 8;
             if (g_mockLines < 8) g_mockLines = 8;
+            g_mockDuplex = len >= 8 + 2 * 64;     /* front + back descriptors */
             g_mockLastOp = 0;
         }
         return 1;

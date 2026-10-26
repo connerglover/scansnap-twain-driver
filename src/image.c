@@ -28,6 +28,45 @@ static void invert_row(BYTE *p, size_t n)
     for (i = 0; i < n; i++) p[i] = (BYTE)~p[i];
 }
 
+/* dst = src with its w pixels in reverse order; dst and src must differ. */
+static void reverse_row(BYTE *dst, const BYTE *src, LONG w, int bpp, size_t rowBytes)
+{
+    LONG x;
+    if (bpp == 1) {
+        memset(dst, 0, rowBytes);
+        for (x = 0; x < w; x++) {
+            LONG from = w - 1 - x;
+            if (src[from >> 3] & (0x80 >> (from & 7))) dst[x >> 3] |= (BYTE)(0x80 >> (x & 7));
+        }
+    } else {
+        size_t px = (size_t)bpp / 8, i;
+        for (x = 0; x < w; x++)
+            for (i = 0; i < px; i++)
+                dst[(size_t)x * px + i] = src[(size_t)(w - 1 - x) * px + i];
+    }
+}
+
+/*
+ * The iX1300 delivers both sides rotated by 180 degrees for a sheet loaded
+ * the way its manual says (U-turn ADF): NAPS2 showed every page, front and
+ * back, upside down and not mirrored. Turn rows and pixels around in place.
+ */
+static BOOL rotate180(Page *p)
+{
+    BYTE *tmp = (BYTE *)malloc(p->rowBytes);
+    LONG y;
+    if (!tmp) return FALSE;
+    for (y = 0; y < (p->height + 1) / 2; y++) {
+        BYTE *top = p->rows + p->rowBytes * (size_t)y;
+        BYTE *bot = p->rows + p->rowBytes * (size_t)(p->height - 1 - y);
+        reverse_row(tmp, top, p->width, p->bpp, p->rowBytes);
+        if (bot != top) reverse_row(top, bot, p->width, p->bpp, p->rowBytes);
+        memcpy(bot, tmp, p->rowBytes);
+    }
+    free(tmp);
+    return TRUE;
+}
+
 BOOL page_from_raw(Page *p, const BYTE *raw, size_t rawLen, LONG w, LONG h,
                    int composition, int interlace, double xres, double yres, int side)
 {
@@ -92,6 +131,10 @@ BOOL page_from_raw(Page *p, const BYTE *raw, size_t rawLen, LONG w, LONG h,
             memcpy(dst, s, (size_t)w);
             invert_row(dst, (size_t)w);
         }
+    }
+    if (!rotate180(p)) {
+        page_free(p);
+        return FALSE;
     }
     return TRUE;
 }

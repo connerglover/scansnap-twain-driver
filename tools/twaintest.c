@@ -202,20 +202,39 @@ static int run_scan(const char *outdir, int pixelType, int duplex, const char *t
             CHECK(info.Planar == FALSE, "Planar FALSE");
         }
 
-        for (;;) {
-            TW_IMAGEMEMXFER x;
-            HGLOBAL h = GlobalAlloc(GHND, mem.Preferred);
-            memset(&x, 0, sizeof x);
-            x.Memory.Flags = TWMF_APPOWNS | TWMF_POINTER;
-            x.Memory.Length = mem.Preferred;
-            x.Memory.TheMem = h;
-            rc = call(DG_IMAGE, DAT_IMAGEMEMXFER, MSG_GET, &x);
-            if (x.BytesWritten) total += x.BytesWritten;
-            GlobalFree(h);
-            if (rc == TWRC_XFERDONE) break;
-            if (rc != TWRC_SUCCESS) { CHECK(0, "IMAGEMEMXFER rc=%u", rc); break; }
+        /*
+         * NAPS2 places each strip by YOffset and copies Rows * BytesPerRow
+         * bytes, so a strip must hold whole rows and continue exactly where
+         * the previous one ended. Byte totals alone miss a strip that splits
+         * a row: the total is right and every band after it is sheared.
+         */
+        {
+            TW_UINT32 rowsSeen = 0, badStrips = 0;
+            for (;;) {
+                TW_IMAGEMEMXFER x;
+                HGLOBAL h = GlobalAlloc(GHND, mem.Preferred);
+                memset(&x, 0, sizeof x);
+                x.Memory.Flags = TWMF_APPOWNS | TWMF_POINTER;
+                x.Memory.Length = mem.Preferred;
+                x.Memory.TheMem = h;
+                rc = call(DG_IMAGE, DAT_IMAGEMEMXFER, MSG_GET, &x);
+                GlobalFree(h);
+                if (rc != TWRC_SUCCESS && rc != TWRC_XFERDONE) {
+                    CHECK(0, "IMAGEMEMXFER rc=%u", rc);
+                    break;
+                }
+                total += x.BytesWritten;
+                if (x.BytesWritten != x.Rows * x.BytesPerRow || x.YOffset != rowsSeen)
+                    badStrips++;
+                rowsSeen += x.Rows;
+                if (rc == TWRC_XFERDONE) break;
+            }
+            CHECK(total > 0, "page %d transferred %lu bytes", pages, total);
+            CHECK(badStrips == 0, "page %d strips hold whole rows at the running YOffset (%lu bad)",
+                  pages, badStrips);
+            CHECK(rowsSeen == (TW_UINT32)info.ImageLength, "page %d strips cover %lu of %ld rows",
+                  pages, rowsSeen, info.ImageLength);
         }
-        CHECK(total > 0, "page %d transferred %lu bytes", pages, total);
         pages++;
 
         memset(&pend, 0, sizeof pend);

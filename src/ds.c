@@ -48,7 +48,6 @@ typedef struct {
     char      fileName[MAX_PATH];
 
     DWORD     transferOffset;
-    LONG      rowsDone;
 } DS;
 
 static DS g_ds;
@@ -657,7 +656,18 @@ static TW_UINT16 start_batch(void)
             g_ds.page = page;
             g_ds.hasPage = 1;
         } else if (rc == PROTO_NODOCS) {
-            g_ds.lastError = TWCC_NOMEDIA;
+            /*
+             * Both paper sensors read empty. Say so here and answer
+             * TWCC_OPERATIONERROR: NAPS2 (TwainScanRunner) treats that code
+             * as "the source already told the user" and adds no dialog of
+             * its own, whereas TWCC_NOMEDIA surfaces as the bare text
+             * "TWAIN error: NoMedia".
+             */
+            MessageBoxA(g_ds.parent,
+                        "No paper is loaded.\n\n"
+                        "Load paper in the feeder or the front Return Scan slot, then scan again.",
+                        "ScanSnap iX1300", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST);
+            g_ds.lastError = TWCC_OPERATIONERROR;
             return TWRC_FAILURE;
         } else {
             g_ds.lastError = twcc(rc);
@@ -705,44 +715,47 @@ static TW_UINT16 native_xfer(TW_MEMREF *out)
     return TWRC_XFERDONE;
 }
 
+/*
+ * One strip of a memory transfer. A strip carries whole rows only: the
+ * application places Rows * BytesPerRow bytes at row YOffset, so a strip
+ * that ends mid-row loses the tail of that row and starts every later strip
+ * part-way into a row (NAPS2 showed this as sheared, repeated bands every
+ * 262144 bytes, with R/G/B rotated).
+ */
 static TW_UINT16 memory_xfer(pTW_IMAGEMEMXFER x)
 {
     const Page *p = &g_ds.page;
+    size_t total, rows, bytes;
     BYTE *dst;
-    DWORD want;
-    DWORD remaining;
 
     if (!g_ds.hasPage || !x) return TWRC_FAILURE;
     if (!x->Memory.TheMem) return TWRC_FAILURE;
 
+    rows = x->Memory.Length / p->rowBytes;
+    if (!rows) {
+        g_ds.lastError = TWCC_BADVALUE;           /* buffer smaller than a row */
+        return TWRC_FAILURE;
+    }
+    total = p->rowBytes * (size_t)p->height;
+    if (rows > (total - g_ds.transferOffset) / p->rowBytes)
+        rows = (total - g_ds.transferOffset) / p->rowBytes;
+    bytes = rows * p->rowBytes;
+
     dst = (BYTE *)GlobalLock((HGLOBAL)x->Memory.TheMem);
     if (!dst) return TWRC_FAILURE;
+    memcpy(dst, p->rows + g_ds.transferOffset, bytes);
+    GlobalUnlock((HGLOBAL)x->Memory.TheMem);
 
     x->Compression = TWCP_NONE;
     x->BytesPerRow = (TW_UINT32)p->rowBytes;
     x->Columns = (TW_UINT32)p->width;
+    x->Rows = (TW_UINT32)rows;
     x->XOffset = 0;
-
-    if (g_ds.rowsDone == 0) g_ds.transferOffset = 0;
-
-    remaining = (DWORD)((size_t)p->rowBytes * (size_t)p->height) - g_ds.transferOffset;
-    want = x->Memory.Length;
-    if (want > remaining) want = remaining;
-    if (want > x->Memory.Length) want = x->Memory.Length;
-
-    memcpy(dst, p->rows + g_ds.transferOffset, want);
-    GlobalUnlock((HGLOBAL)x->Memory.TheMem);
-
-    x->BytesWritten = want;
-    x->Rows = (TW_UINT32)(want / p->rowBytes);
     x->YOffset = (TW_UINT32)(g_ds.transferOffset / p->rowBytes);
-    g_ds.transferOffset += want;
-    g_ds.rowsDone += (LONG)x->Rows;
+    x->BytesWritten = (TW_UINT32)bytes;
+    g_ds.transferOffset += (DWORD)bytes;
 
-    if (g_ds.transferOffset >= (DWORD)((size_t)p->rowBytes * (size_t)p->height)) {
-        return TWRC_XFERDONE;
-    }
-    return TWRC_SUCCESS;
+    return g_ds.transferOffset >= total ? TWRC_XFERDONE : TWRC_SUCCESS;
 }
 
 static TW_UINT16 file_xfer(void)
@@ -890,7 +903,6 @@ static TW_UINT16 ds_enable(TW_USERINTERFACE *ui)
     g_ds.parent = (HWND)ui->hParent;
     g_ds.enabled = 1;
     g_ds.transferOffset = 0;
-    g_ds.rowsDone = 0;
     g_ds.batchDone = 0;
 
     if (start_batch() != TWRC_SUCCESS) {
@@ -926,7 +938,6 @@ static TW_UINT16 ds_pending(TW_UINT16 msg, pTW_PENDINGXFERS pending)
         page_free(&g_ds.page);
         g_ds.hasPage = 0;
         g_ds.transferOffset = 0;
-        g_ds.rowsDone = 0;
         if (!g_ds.batchDone) {
             next_page();
             if (g_ds.hasPage) {

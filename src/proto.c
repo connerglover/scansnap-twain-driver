@@ -219,6 +219,7 @@ static int read_vpd(Link *l, ProtoInfo *info)
     info->hasGray    = (buf[0x1C] & 0x08) != 0;
     info->hasColor   = (buf[0x1C] & 0x80) != 0;
     info->hasDuplex  = info->hasAdf && info->duplexOffset != 0;
+    info->hasReturnPath = len > 0x7C && (buf[0x7C] & 0x80) != 0;
 
     /* standard resolutions: 8 flags in byte 0x12, 8 in byte 0x13 */
     {
@@ -231,10 +232,10 @@ static int read_vpd(Link *l, ProtoInfo *info)
         for (i = 0; i < 8; i++)
             if (buf[0x13] & (1 << (7 - i))) info->stdRes[info->stdResCount++] = highOrder[i];
     }
-    LOGF("proto: vpd basic %dx%d max %dx%d window %ldx%ld color %d gray %d lineart %d duplex %d\n",
+    LOGF("proto: vpd basic %dx%d max %dx%d window %ldx%ld color %d gray %d lineart %d duplex %d returnpath %d\n",
          info->basicXRes, info->basicYRes, info->maxXRes, info->maxYRes,
          info->maxWidthUnits, info->maxLengthUnits,
-         info->hasColor, info->hasGray, info->hasLineart, info->hasDuplex);
+         info->hasColor, info->hasGray, info->hasLineart, info->hasDuplex, info->hasReturnPath);
     return PROTO_OK;
 }
 
@@ -462,43 +463,77 @@ int proto_object_position(Proto *p, int function)
     return do_cmd(&l, cdb, 10, NULL, 0, NULL, NULL, 30000);
 }
 
-int proto_hw_status(Proto *p, BYTE out[12], DWORD *got)
+/* GET HW STATUS (C2), `len` bytes (12 for the classic layout; ScanSnap Home's
+ * monitor polls 48). Bit layout: docs/PROTOCOL.md section 3b. */
+int proto_hw_status(Proto *p, BYTE *out, DWORD len, DWORD *got)
 {
     Link l;
     BYTE cdb[10];
-    DWORD len = 12;
+    DWORD n = len;
     int rc;
 
     memset(&l, 0, sizeof l); l.t = p->t;
     memset(cdb, 0, sizeof cdb);
     cdb[0] = 0xC2;
-    putn(cdb + 7, 12, 2);
-    memset(out, 0, 12);
-    rc = do_cmd(&l, cdb, 10, NULL, 0, out, &len, 30000);
-    if (got) *got = len;
+    putn(cdb + 7, len, 2);
+    memset(out, 0, len);
+    rc = do_cmd(&l, cdb, 10, NULL, 0, out, &n, 30000);
+    if (got) *got = n;
     return rc;
+}
+
+/*
+ * Paper sensors, GET HW STATUS byte 3 (PROTOCOL.md 3b; observed on the
+ * iX1300): bit 7 set = U-turn hopper empty, bit 0 set = front Return Scan
+ * slot loaded. ScanSnap Home masks the two together the same way.
+ */
+enum { PAPER_UNKNOWN, PAPER_NONE, PAPER_ADF, PAPER_FRONT };
+
+static int paper_sensors(Proto *p)
+{
+    BYTE st[12];
+    DWORD got = 0;
+    if (proto_hw_status(p, st, sizeof st, &got) != PROTO_OK || got < 4) return PAPER_UNKNOWN;
+    switch (st[3] & 0x81) {
+    case 0x80: return PAPER_NONE;
+    case 0x81: return PAPER_FRONT;
+    default:   return PAPER_ADF;     /* hopper loaded, front slot either way */
+    }
 }
 
 int proto_hopper_has_paper(Proto *p)
 {
-    BYTE st[12];
-    DWORD got = 0;
-    if (proto_hw_status(p, st, &got) != PROTO_OK || got < 4) return 1;
-    return (st[3] & 0x80) == 0;
+    return paper_sensors(p) != PAPER_NONE;
 }
 
 /* ----------------------------------------------------------------- begin */
 
 int proto_begin(Proto *p, const ScanJob *job)
 {
-    int rc, attempt;
+    static const char *const paperName[] = { "unreadable", "empty", "hopper", "front slot" };
+    int rc, attempt, paper, rpath;
 
     p->job = *job;
     p->armed = 0;
     p->batch = 0;
 
-    rc = scanner_control(p, 0x00);               /* ADF source */
-    if (rc != PROTO_OK) LOGF("proto: ADF select returned %d (ignored)\n", rc);
+    /*
+     * Paper path, chosen once per batch from the sensors: the front Return
+     * Scan slot (0x2f, SANE's SC_function_rpath) only when it is the sole
+     * loaded input, as ScanSnap Home does; otherwise the U-turn ADF (0x00).
+     * With neither loaded the batch is refused before any motor command, as
+     * ScanSnap Home does: a feed on an empty unit answers 03/80/03 or, at
+     * times, 03/80/01 (the paper-jam code). Between sheets the sensors are
+     * not consulted: the unit may already have picked the next sheet past
+     * them, and the feed's own answer ends the batch.
+     */
+    paper = paper_sensors(p);
+    LOGF("proto: paper sensors %s\n", paperName[paper]);
+    if (paper == PAPER_NONE) return PROTO_NODOCS;
+    rpath = paper == PAPER_FRONT && p->info.hasReturnPath;
+    rc = scanner_control(p, rpath ? 0x2F : 0x00);
+    if (rc != PROTO_OK) LOGF("proto: %s select returned %d (ignored)\n",
+                             rpath ? "return path" : "ADF", rc);
 
     if ((rc = mode_select_auto(p, job->autoLength)) != PROTO_OK)
         LOGF("proto: auto mode select %d (ignored)\n", rc);
@@ -529,14 +564,6 @@ int proto_feed(Proto *p)
     Link l;
     BYTE cdb[10];
     int rc;
-
-    /*
-     * Do not gate on the hopper sensor. It is one bit (`byte3 & 0x80`) that
-     * disagrees with reality on this unit - it reads "empty" with paper
-     * loaded - and gating on it fails every scan before the scanner is even
-     * asked. SANE pre-checks it only for the iX500; elsewhere the feed itself
-     * reports no-documents, which is authoritative.
-     */
 
     memset(&l, 0, sizeof l); l.t = p->t;
     memset(cdb, 0, sizeof cdb);
@@ -629,13 +656,23 @@ int proto_wait_image(Proto *p, int back, LONG bytes, int attempts)
     return PROTO_NODATA;
 }
 
-int proto_read_image(Proto *p, int back, BYTE *buf, DWORD want, DWORD *got)
+/*
+ * One READ of image data. *flags gets PROTO_READ_ILI for a short read and
+ * PROTO_READ_EOM at end of medium; *got is the valid byte count.
+ *
+ * "No image data yet" (03/80/13) and busy still run a full data phase on the
+ * wire - the unit sends `want` filler bytes - so *got is forced to 0: those
+ * bytes are not image. SANE treats 03/80/13 the same way (DEVICE_BUSY, block
+ * discarded).
+ */
+int proto_read_image(Proto *p, int back, BYTE *buf, DWORD want, DWORD *got, int *flags)
 {
     Link l;
     BYTE cdb[10];
     DWORD len = want;
     int rc;
 
+    *flags = 0;
     memset(&l, 0, sizeof l); l.t = p->t;
     memset(cdb, 0, sizeof cdb);
     cdb[0] = 0x28;
@@ -644,16 +681,24 @@ int proto_read_image(Proto *p, int back, BYTE *buf, DWORD want, DWORD *got)
     putn(cdb + 6, want, 3);
     rc = do_cmd(&l, cdb, 10, NULL, 0, buf, &len, 30000);
     *got = len;
-    if (rc == PROTO_OK) return rc;
-    if (rc == PROTO_ERROR) {
-        /* benign end-of-page: sense 0/0 with EOM or ILI */
-        if (l.lastSense.key == 0x00 && l.lastSense.asc == 0x00 &&
-            (l.lastSense.eom || l.lastSense.ili)) {
-            if (l.lastSense.ili && len == want && l.lastSense.info < want)
-                *got = want - l.lastSense.info;
-            return PROTO_OK;
+    if (rc == PROTO_ERROR &&
+        l.lastSense.key == 0x00 && l.lastSense.asc == 0x00 &&
+        (l.lastSense.eom || l.lastSense.ili)) {
+        /* benign end-of-page: sense 0/0 with EOM or ILI; the information
+         * field is the residue of `want`, the rest of the data phase pad */
+        if (l.lastSense.ili) {
+            DWORD valid = l.lastSense.info <= want ? want - l.lastSense.info : 0;
+            if (valid < *got) *got = valid;
         }
+        if (l.lastSense.ili) *flags |= PROTO_READ_ILI;
+        if (l.lastSense.eom) *flags |= PROTO_READ_EOM;
+        rc = PROTO_OK;
+    } else if (rc == PROTO_NODATA || rc == PROTO_BUSY) {
+        *got = 0;
     }
+    LOGF("proto: read %s want %lu got %lu rc %d%s%s\n", back ? "back" : "front",
+         want, *got, rc, (*flags & PROTO_READ_ILI) ? " ili" : "",
+         (*flags & PROTO_READ_EOM) ? " eom" : "");
     return rc;
 }
 

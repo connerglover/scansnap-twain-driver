@@ -37,7 +37,10 @@ Session *session_create(void)
     char path[MAX_PATH];
     if (!s) return NULL;
     if (g_cfg.mock) s->t = transport_open_mock_synthetic();
-    else s->t = transport_open(path, sizeof path);
+    else {
+        transport_request_device();
+        s->t = transport_open(path, sizeof path);
+    }
     if (!s->t) {
         LOGF("session: no scanner found\n");
         free(s);
@@ -87,75 +90,145 @@ int session_present(Session *s)
 
 /* ---------------------------------------------------------------- scanning */
 
-static LONG page_bytes(const ScanJob *j, LONG w, LONG h)
+/* Image READs are line-aligned blocks of at most this many bytes. */
+#define READ_BLOCK 262144u
+
+/* One side of the sheet being read. */
+typedef struct {
+    int   back;         /* window 0x80 */
+    LONG  w, h, bpl;
+    LONG  want, got;
+    BYTE *raw;
+    int   ready;        /* read-image-count answered */
+    int   lastIli;      /* this side's last READ was short */
+    int   done;
+} Side;
+
+static LONG bytes_per_line(const ScanJob *j, LONG w)
 {
-    int bpl;
-    if (j->composition == COMP_COLOR) bpl = w * 3;
-    else if (j->composition == COMP_LINEART) bpl = (w + 7) / 8;
-    else bpl = w;
-    return (LONG)((size_t)bpl * (size_t)h);
+    if (j->composition == COMP_COLOR) return w * 3;
+    if (j->composition == COMP_LINEART) return (w + 7) / 8;
+    return w;
 }
 
-/* Reads one side of a sheet into a Page. */
-static int read_side(Session *s, int back, LONG w, LONG h, Page *out)
+/* Sizes one side from its pixel-size answer, else from the job geometry. */
+static int side_init(Session *s, Side *sd, int back)
+{
+    LONG w = s->job.pixelsWide, h = 0;
+
+    memset(sd, 0, sizeof *sd);
+    sd->back = back;
+    if (proto_pixel_size(s->p, back, &w, &h) != PROTO_OK) {
+        w = s->job.pixelsWide;
+        h = 0;
+    }
+    if (w <= 0) w = s->job.pixelsWide;
+    if (h <= 0) {
+        h = (LONG)((long long)s->job.lengthUnits * s->job.resY / 1200);
+        if (!s->pixelWarned) {
+            LOGF("session: pixel size unavailable, assuming %ldx%ld\n", w, h);
+            s->pixelWarned = 1;
+        }
+    }
+    sd->w = w;
+    sd->h = h;
+    sd->bpl = bytes_per_line(&s->job, w);
+    if (sd->bpl <= 0 || h <= 0 || (size_t)sd->bpl * (size_t)h > MAX_PAGE_BYTES) return PROTO_ERROR;
+    sd->want = sd->bpl * h;
+    sd->raw = (BYTE *)calloc((size_t)sd->want + 16, 1);
+    return sd->raw ? PROTO_OK : PROTO_ERROR;
+}
+
+static void side_free(Side *sd)
+{
+    free(sd->raw);
+    sd->raw = NULL;
+}
+
+/*
+ * Reads every side of the current sheet. Duplex alternates front and back
+ * one block at a time, as SANE does for this generation: while one side's
+ * data is not ready the unit answers "no image data yet" (03/80/13), and a
+ * side read to completion before the other is touched stalls. A side ends
+ * when its buffer is full, or - SANE's rule - once end of medium has been
+ * seen and that side's last READ was short (ILI).
+ */
+static int read_sheet(Session *s, Side *sides, int n)
 {
     Proto *p = s->p;
-    LONG want = page_bytes(&s->job, w, h);
-    LONG bytesPerLine = s->job.composition == COMP_COLOR ? w * 3
-                        : s->job.composition == COMP_LINEART ? (LONG)((w + 7) / 8) : w;
-    BYTE *raw;
-    LONG got = 0;
-    int rc;
+    int eom = 0, i, rc;
+    DWORD idleMs = 0;
 
-    if (want <= 0 || want > (LONG)MAX_PAGE_BYTES) return PROTO_ERROR;
-    raw = (BYTE *)calloc((size_t)want + 16, 1);
-    if (!raw) return PROTO_ERROR;
+    for (;;) {
+        int progress = 0, open = 0;
 
-    /* READ/read-image-count carry a 3-byte length: never ask for more. */
-    rc = proto_wait_image(p, back, want > 0x200000 ? 0x200000 : want, 600);
-    if (rc != PROTO_OK) {
-        LOGF("session: image never became ready (%d)\n", rc);
-        free(raw);
-        return rc;
-    }
+        for (i = 0; i < n; i++) {
+            Side *sd = &sides[i];
+            DWORD chunk, got = 0;
+            int flags = 0;
 
-    while (got < want) {
-        DWORD chunk = (DWORD)(want - got);
-        DWORD n = 0;
-        if (chunk > 262144u) chunk = 262144u;
-        if (bytesPerLine > 0 && (LONG)chunk > bytesPerLine) chunk -= chunk % (DWORD)bytesPerLine;
-        if (!chunk) chunk = (DWORD)(want - got);
-        if ((LONG)(got + (LONG)chunk) > want) chunk = (DWORD)(want - got);
+            if (sd->done) continue;
+            if (!sd->ready) {
+                /* READ/read-image-count carry a 3-byte length: never ask for more. */
+                rc = proto_wait_image(p, sd->back, sd->want > 0x200000 ? 0x200000 : sd->want, 600);
+                if (rc != PROTO_OK) {
+                    LOGF("session: %s image never became ready (%d)\n", sd->back ? "back" : "front", rc);
+                    return rc;
+                }
+                sd->ready = 1;
+            }
 
-        rc = proto_read_image(p, back, raw + got, chunk, &n);
-        if (rc != PROTO_OK) {
-            if (n) { got += n; continue; }
-            LOGF("session: read failed %d after %ld bytes\n", rc, got);
-            free(raw);
-            return rc;
+            chunk = (DWORD)(sd->want - sd->got);
+            if (chunk > READ_BLOCK) {
+                chunk = READ_BLOCK;
+                if (chunk > (DWORD)sd->bpl) chunk -= chunk % (DWORD)sd->bpl;
+            }
+            rc = proto_read_image(p, sd->back, sd->raw + sd->got, chunk, &got, &flags);
+            if (rc == PROTO_NODATA || rc == PROTO_BUSY) {
+                sd->lastIli = 0;
+                continue;
+            }
+            if (rc != PROTO_OK) {
+                LOGF("session: %s read failed %d after %ld bytes\n",
+                     sd->back ? "back" : "front", rc, sd->got);
+                return rc;
+            }
+            sd->got += (LONG)got;
+            sd->lastIli = (flags & PROTO_READ_ILI) != 0;
+            if (flags & PROTO_READ_EOM) eom = 1;
+            if (got) progress = 1;
+            if (sd->got >= sd->want) sd->done = 1;
         }
-        if (!n) break;
-        got += n;
-        if (n < chunk) break;
-    }
 
-    if (got < want) {
-        /* short page: keep whole lines */
-        if (bytesPerLine > 0) got -= got % bytesPerLine;
-        LOGF("session: short page %ld/%ld bytes\n", got, want);
-    }
-    if (got <= 0) { free(raw); return PROTO_ERROR; }
-
-    {
-        LONG lines = bytesPerLine > 0 ? got / bytesPerLine : h;
-        if (lines <= 0) lines = h;
-        if (!page_from_raw(out, raw, (size_t)got, w, lines, s->job.composition,
-                           p->interlace, s->job.resX, s->job.resY, back)) {
-            free(raw);
-            return PROTO_ERROR;
+        for (i = 0; i < n; i++) {
+            if (eom && sides[i].lastIli) sides[i].done = 1;
+            if (!sides[i].done) open = 1;
         }
+        if (!open) return PROTO_OK;
+        if (progress) {
+            idleMs = 0;
+            continue;
+        }
+        if (idleMs >= 30000) {
+            LOGF("session: no image data for %lu ms (eom %d)\n", idleMs, eom);
+            return eom ? PROTO_OK : PROTO_NODATA;
+        }
+        Sleep(20);
+        idleMs += 20;
     }
-    free(raw);
+}
+
+/* Turns what one side delivered into a Page, keeping whole lines only. */
+static int side_page(Session *s, const Side *sd, Page *out)
+{
+    LONG got = sd->got - sd->got % sd->bpl;
+
+    if (got < sd->want)
+        LOGF("session: short page %ld/%ld bytes (%s)\n", got, sd->want, sd->back ? "back" : "front");
+    if (got <= 0) return PROTO_ERROR;
+    if (!page_from_raw(out, sd->raw, (size_t)got, sd->w, got / sd->bpl, s->job.composition,
+                       s->p->interlace, s->job.resX, s->job.resY, sd->back))
+        return PROTO_ERROR;
     return PROTO_OK;
 }
 
@@ -164,81 +237,58 @@ static int read_side(Session *s, int back, LONG w, LONG h, Page *out)
 static int fetch_page(Session *s, Page *page, int *isBack)
 {
     Proto *p = s->p;
-    int rc;
+    Side sides[2];
+    Page front, rear;
+    int n = 0, rc, haveRear = 0;
+    /* duplex reads both windows; simplex reads the one the job names */
+    int first = s->job.duplex ? 0 : s->job.feedFromBack;
 
     if (s->exhausted) return PROTO_NODOCS;
 
-    for (;;) {
-        LONG w = s->job.pixelsWide, h = 0;
-        int back = s->job.feedFromBack;
-        Page front, rear;
-        int haveFront = 0, haveRear = 0;
-
-        if (!s->started) {
-            rc = proto_begin(p, &s->job);
-            if (rc != PROTO_OK) return rc;
-            s->started = 1;
-        }
-
-        rc = proto_feed(p);
-        if (rc == PROTO_NODOCS) {
-            s->exhausted = 1;
-            proto_end(p);
-            s->started = 0;
-            return PROTO_NODOCS;
-        }
+    if (!s->started) {
+        rc = proto_begin(p, &s->job);
         if (rc != PROTO_OK) return rc;
-
-        rc = proto_start_scan(p);
-        if (rc != PROTO_OK) return rc;
-
-        if (proto_pixel_size(p, back, &w, &h) != PROTO_OK) {
-            w = s->job.pixelsWide;
-            h = (LONG)((long long)s->job.lengthUnits * s->job.resY / 1200);
-            if (!s->pixelWarned) {
-                LOGF("session: pixel size unavailable, assuming %ldx%ld\n", w, h);
-                s->pixelWarned = 1;
-            }
-        }
-        if (w <= 0) w = s->job.pixelsWide;
-        if (h <= 0) h = (LONG)((long long)s->job.lengthUnits * s->job.resY / 1200);
-
-        memset(&front, 0, sizeof front);
-        memset(&rear, 0, sizeof rear);
-
-        rc = read_side(s, back, w, h, &front);
-        if (rc != PROTO_OK) return rc;
-        haveFront = 1;
-
-        if (s->job.duplex) {
-            LONG bw = w, bh = h;
-            if (proto_pixel_size(p, 1, &bw, &bh) != PROTO_OK) { bw = w; bh = h; }
-            if (bw <= 0) bw = w;
-            if (bh <= 0) bh = h;
-            rc = read_side(s, 1, bw, bh, &rear);
-            if (rc == PROTO_OK) haveRear = 1;
-            else LOGF("session: back side unavailable (%d)\n", rc);
-        }
-
-        if (haveFront) {
-            page_free(page);
-            *page = front;
-            if (isBack) *isBack = back;
-            if (haveRear) {
-                /* queue the back side as the following page */
-                page_free(&s->pending);
-                s->pending = rear;
-                s->havePending = 1;
-            }
-            return PROTO_OK;
-        }
-        if (haveRear) {
-            *page = rear;
-            if (isBack) *isBack = 1;
-            return PROTO_OK;
-        }
-        return PROTO_ERROR;
+        s->started = 1;
     }
+
+    rc = proto_feed(p);
+    if (rc == PROTO_NODOCS) {
+        s->exhausted = 1;
+        proto_end(p);
+        s->started = 0;
+        return PROTO_NODOCS;
+    }
+    if (rc != PROTO_OK) return rc;
+
+    rc = proto_start_scan(p);
+    if (rc != PROTO_OK) return rc;
+
+    memset(sides, 0, sizeof sides);
+    memset(&front, 0, sizeof front);
+    memset(&rear, 0, sizeof rear);
+
+    rc = side_init(s, &sides[n++], first);
+    if (rc == PROTO_OK && s->job.duplex) rc = side_init(s, &sides[n++], 1);
+    if (rc == PROTO_OK) rc = read_sheet(s, sides, n);
+    if (rc == PROTO_OK) rc = side_page(s, &sides[0], &front);
+    side_free(&sides[0]);
+    if (rc == PROTO_OK && n > 1) {
+        if (side_page(s, &sides[1], &rear) == PROTO_OK) haveRear = 1;
+        else LOGF("session: back side unavailable\n");
+    }
+    side_free(&sides[1]);
+    if (rc != PROTO_OK) return rc;
+
+    page_free(page);
+    *page = front;
+    if (isBack) *isBack = first;
+    if (haveRear) {
+        /* queue the back side as the following page */
+        page_free(&s->pending);
+        s->pending = rear;
+        s->havePending = 1;
+    }
+    return PROTO_OK;
 }
 
 void session_reset(Session *s)

@@ -56,6 +56,7 @@ static void push_vpd(void)
     buf[0x1C] = 0x8A;                      /* lineart + gray + rgb */
     buf[0x12] = 0x08;                      /* 150 dpi */
     buf[0x13] = 0x06;                      /* 300 + 600 */
+    buf[0x7C] = 0x80;                      /* return path, as the iX1300 reports */
     mock_push(buf, 204);
     push_envelope_status(0);
 }
@@ -74,6 +75,42 @@ static void push_busy(void)
     sense[2] = 0x02;            /* sense key 2 = not ready */
     mock_push(sense, sizeof sense);
     push_envelope_status(0);
+}
+
+/* CHECK CONDITION with the given 03/80/xx sense, then REQUEST SENSE status. */
+static void push_sense_80(BYTE ascq)
+{
+    BYTE sense[0x12];
+    push_envelope_status(1);
+    memset(sense, 0, sizeof sense);
+    sense[0] = 0x70; sense[2] = 0x03;
+    sense[12] = 0x80; sense[13] = ascq;
+    mock_push(sense, sizeof sense);
+    push_envelope_status(0);
+}
+
+/*
+ * proto_begin with GET HW STATUS byte 3 = `b3`, everything else accepted.
+ * Clears the command log first, so command 0 is C2 and command 1 the path
+ * select.
+ */
+static int begin_with_sensors(Proto *p, const ScanJob *job, BYTE b3)
+{
+    BYTE hw[12];
+    int i;
+    mock_reset();
+    memset(hw, 0, sizeof hw);
+    hw[3] = b3;
+    mock_push(hw, sizeof hw);
+    push_ok();
+    for (i = 0; i < 7; i++) push_ok();   /* path, 4 mode selects, window, lamp */
+    return proto_begin(p, job);
+}
+
+static int sent_path_select(BYTE b1, BYTE b2)
+{
+    const BYTE *c0 = mock_sent_cdb(0), *c1 = mock_sent_cdb(1);
+    return c0 && c0[0] == 0xC2 && c1 && c1[0] == 0xF1 && c1[1] == b1 && c1[2] == b2;
 }
 
 int main(void)
@@ -112,6 +149,7 @@ int main(void)
     CHECK(p->info.maxWidthUnits == 10200, "max width units %ld", p->info.maxWidthUnits);
     CHECK(p->info.stdResCount >= 3, "std res count %d", p->info.stdResCount);
     CHECK(strcmp(p->info.version, "0M00") == 0, "rom revision '%s'", p->info.version);
+    CHECK(p->info.hasReturnPath, "return path reported");
 
     /* --- begin: ADF, 3 mode selects, window probe, lamp --- */
     memset(&job, 0, sizeof job);
@@ -125,6 +163,12 @@ int main(void)
     job.autoLength = 1;
     job.brightness = 0; job.contrast = 0;
 
+    {
+        BYTE hw[12];
+        memset(hw, 0, sizeof hw);     /* hopper loaded, front slot empty */
+        mock_push(hw, sizeof hw);
+        push_ok();
+    }
     push_ok();      /* f1/00 ADF */
     push_ok();      /* mode select 3c */
     push_ok();      /* mode select 38 */
@@ -145,19 +189,9 @@ int main(void)
     rc = proto_feed(p);
     CHECK(rc == PROTO_OK, "proto_feed rc=%d", rc);
 
-    /*
-     * Feed without a hopper pre-check must still report an empty feeder, and
-     * the scanner's answer to the feed is what decides it.
-     */
-    {
-        BYTE sense[0x12];
-        push_envelope_status(1);      /* CHECK CONDITION */
-        memset(sense, 0, sizeof sense);
-        sense[0] = 0x70; sense[2] = 0x03;
-        sense[12] = 0x80; sense[13] = 0x03;   /* no documents */
-        mock_push(sense, sizeof sense);
-        push_ok();
-    }
+    /* A sensor that reads wrong must not block a scan: the scanner's answer
+     * to the feed decides, and its end-of-batch code is no documents. */
+    push_sense_80(0x03);
     rc = proto_feed(p);
     CHECK(rc == PROTO_NODOCS, "feed on empty feeder rc=%d", rc);
 
@@ -186,29 +220,56 @@ int main(void)
     {
         BYTE img[300];
         DWORD n = 0;
+        int flags = -1;
         memset(img, 0x11, sizeof img);
         mock_push(img, 300);
         push_ok();
-        rc = proto_read_image(p, 0, img, 300, &n);
-        CHECK(rc == PROTO_OK && n == 300, "proto_read_image rc=%d n=%lu", rc, n);
+        rc = proto_read_image(p, 0, img, 300, &n, &flags);
+        CHECK(rc == PROTO_OK && n == 300 && flags == 0, "proto_read_image rc=%d n=%lu flags=%d", rc, n, flags);
     }
 
     /* --- short read signalled by ILI: 100 of 300 bytes delivered --- */
     {
         BYTE img[300];
         DWORD n = 0;
+        int flags = 0;
         BYTE sense[0x12];
         memset(img, 0, sizeof img);
         mock_push(img, 300);
         push_envelope_status(1);
         memset(sense, 0, sizeof sense);
         sense[0] = 0x70;
-        sense[2] = 0x20;             /* ILI, sense key 0 */
+        sense[2] = 0x60;             /* EOM + ILI, sense key 0 */
         sense[3] = 0; sense[4] = 0; sense[5] = 0; sense[6] = 200;
         mock_push(sense, sizeof sense);
         push_ok();
-        rc = proto_read_image(p, 0, img, 300, &n);
+        rc = proto_read_image(p, 0, img, 300, &n, &flags);
         CHECK(rc == PROTO_OK && n == 100, "ILI short read rc=%d n=%lu", rc, n);
+        CHECK(flags == (PROTO_READ_ILI | PROTO_READ_EOM), "ILI/EOM flags %d", flags);
+    }
+
+    /*
+     * --- "no image data yet" (03/80/13): the iX1300 still sends a full data
+     * phase of filler, then CHECK CONDITION. Those bytes are not image.
+     * Counting them put solid gray bands into every duplex page. ---
+     */
+    {
+        BYTE img[300];
+        DWORD n = 0;
+        int flags = 0;
+        BYTE sense[0x12];
+        memset(img, 0x56, sizeof img);
+        mock_push(img, 300);
+        push_envelope_status(1);
+        memset(sense, 0, sizeof sense);
+        sense[0] = 0x70;
+        sense[2] = 0x03;
+        sense[12] = 0x80; sense[13] = 0x13;
+        mock_push(sense, sizeof sense);
+        push_ok();
+        rc = proto_read_image(p, 0, img, 300, &n, &flags);
+        CHECK(rc == PROTO_NODATA && n == 0, "no-data READ rc=%d n=%lu (filler discarded)", rc, n);
+        CHECK(mock_pending() == 0, "no-data READ leaves the pipe aligned");
     }
 
     /* --- status data with a CHECK CONDITION (sense key 2 = not ready) --- */
@@ -219,7 +280,7 @@ int main(void)
         mock_push(hw, 12);
         push_busy();
     }
-    rc = proto_hw_status(p, st, &got);
+    rc = proto_hw_status(p, st, 12, &got);
     CHECK(rc == PROTO_BUSY, "hw status busy rc=%d", rc);
     CHECK(got == 12, "busy status data length %lu", got);
 
@@ -243,7 +304,7 @@ int main(void)
         CHECK(rc == PROTO_OK, "second command aligned rc=%d", rc);
     }
 
-    /* --- the hopper sensor is advisory, not a gate --- */
+    /* --- hardware status reads the 12-byte layout --- */
     {
         BYTE hw[12];
         memset(hw, 0, sizeof hw);
@@ -251,13 +312,33 @@ int main(void)
         mock_push(hw, 12);
         push_ok();
     }
-    rc = proto_hw_status(p, st, &got);
+    rc = proto_hw_status(p, st, 12, &got);
     CHECK(rc == PROTO_OK && got == 12, "hw status readable rc=%d", rc);
 
     /* --- end --- */
     push_ok();
     rc = proto_end(p);
     CHECK(rc == PROTO_OK, "proto_end rc=%d", rc);
+
+    /* --- paper path and no-paper, from the sensors at batch start --- */
+    rc = begin_with_sensors(p, &job, 0x81);
+    CHECK(rc == PROTO_OK && sent_path_select(0x0F, 0x02),
+          "front slot only selects the return path (F1 0F 02) rc=%d", rc);
+
+    rc = begin_with_sensors(p, &job, 0x01);
+    CHECK(rc == PROTO_OK && sent_path_select(0x00, 0x00),
+          "hopper and front slot loaded selects the U-turn ADF rc=%d", rc);
+
+    /* nothing loaded: refused after the status read, no motor command */
+    rc = begin_with_sensors(p, &job, 0x80);
+    CHECK(rc == PROTO_NODOCS && mock_sent_cdb_count() == 1,
+          "nothing loaded is no documents before any feed rc=%d commands=%lu",
+          rc, (unsigned long)mock_sent_cdb_count());
+
+    rc = begin_with_sensors(p, &job, 0x00);
+    push_sense_80(0x01);
+    rc = proto_feed(p);
+    CHECK(rc == PROTO_JAM, "jam sense with paper in the hopper stays a jam rc=%d", rc);
 
     proto_destroy(p);
     transport_close(t);

@@ -53,7 +53,7 @@ Status 0 = good, 8 = busy, else CHECK CONDITION -> `REQUEST SENSE (0x03)`,
 |---|---|---|
 | `02/00/00` | not ready | busy, retry |
 | `00/00/xx` with EOM or ILI | end of page | success, honour ILI length |
-| `03/80/13` | no image data yet | poll again |
+| `03/80/13` | no image data yet | discard the block (the unit still sends a full data phase of filler), read again |
 | `03/80/03`, `20`, `30` | no documents | feeder empty |
 | `03/80/02` | cover / ADF open | interlock |
 | `03/80/01`,`04`,`07`,`08` | jam | paper jam |
@@ -71,8 +71,8 @@ Status 0 = good, 8 = busy, else CHECK CONDITION -> `REQUEST SENSE (0x03)`,
 | `0x1b` | SCAN | data-out is the window id list (`00`, `80`) |
 | `0x31` | OBJECT POSITION | `01` feed, `04` halt |
 | `0x28` | READ | datatype `0x80` pixel size (32 B), `0x00` image (3-byte length) |
-| `0xc2` | GET HW STATUS | 12 B; `byte3 & 0x80` = hopper **empty** (advisory - see below) |
-| `0xf1` | SCANNER CONTROL | `00` ADF, `04` cancel, `05` lamp on; bit 4 set + `0x10` = read-image-count |
+| `0xc2` | GET HW STATUS | 12 B classic, 48 B as ScanSnap Home polls; see 3b |
+| `0xf1` | SCANNER CONTROL | function = byte1 low nibble + byte2 high nibble: `00` ADF (U-turn), `04` cancel, `05` lamp on, `0a` (vendor sends before a return-path feed; meaning unknown), `2f` return path (`F1 0F 02`); byte1 bit 4 + `0x10` = read-image-count |
 | `0x2a` | SEND | LUT `0x83`, JPEG q-table `0x88` (only iX500/iX100 need these) |
 
 Window descriptor (**observed** in both implementations):
@@ -89,25 +89,61 @@ Window descriptor (**observed** in both implementations):
 35 paper select (0xc0 non-standard)  36 paper width  3a paper length
 ```
 
-## 3a. The hopper bit is advisory
+## 3a. Paper sensors, paper path and an empty feeder
 
-**Observed** on this unit: `GET HW STATUS` returns `00 00 00 80 00 ...`
-permanently - byte 3 bit 7 set, which both this driver and sane-backends read
-as "hopper empty" - while paper sits in the ADF and `err` (byte 7) is 0. The
-`OBJECT POSITION feed` that follows answers sense `03/80/03`, i.e. the scanner
-itself also reports no documents, so the two agree even though the feeder is
-loaded.
+**Observed** with `probe status` (48-byte C2, polled every 100 ms) while
+loading and unloading each input:
 
-**Consequence**: do not gate a scan on that bit. SANE pre-checks it only for
-the iX500 ("errors if op is called with no paper at the beginning of a batch");
-everywhere else the feed's own answer is authoritative. This driver used to
-gate on it and aborted every scan before issuing a command.
+| Loaded | byte 3 | Driver |
+|---|---|---|
+| nothing | `80` | no documents, **no feed issued** |
+| U-turn ADF only | `00` | ADF path (`F1 00`) |
+| front Return Scan slot only | `81` | return path (`F1 0F 02`) |
+| both | `01` | ADF path, as ScanSnap Home does |
 
-Not yet established: whether this unit reads the bit correctly on the
-U-turn ADF path only, and whether its front **Return Scan** feeder is the one
-the sensor actually tracks. The driver drives the U-turn path
-(`feedFromBack = 0`), so a sheet loaded in the front slot would explain the
-reading exactly.
+The sensors are read once, at the start of a batch (`proto_begin`). Between
+sheets the feed's own answer (`03/80/03`) ends the batch: the unit may have
+picked the next sheet past the sensor already.
+
+**Why not just feed:** on an empty unit the feed answers `03/80/03` at some
+times and `03/80/01` - the paper-jam code - at others (NAPS2 run at 18:35:56,
+`%TEMP%\ScanSnapTWAIN.log`), so the feed cannot tell "no paper" from a jam,
+and it runs the motor. ScanSnap Home makes the same check before feeding
+(re-notes). A sheet in the front slot with the ADF path selected also answers
+`03/80/01`.
+
+An earlier note here called byte 3 bit 7 "advisory" because it read `80` with
+"paper in the ADF". With both sensors known, that reading means nothing was in
+the U-turn hopper - most likely the sheet sat in the front slot.
+
+**Return path, observed**: `F1 0F 02` before mode select/window, then the
+ordinary `31 01` feed and `SCAN`: the sheet in the front slot goes through and
+out, one page 2550x3319 at 300 dpi ending with EOM + ILI, then `03/80/03`.
+After a return-path batch the unit pulls a newly inserted front-slot sheet in
+part way and byte 2 reads `80` (meaning not established).
+ScanSnap Home's extra `F1 0A` before the feed answered `03/80/01` here and is
+not sent.
+
+## 3b. GET HW STATUS bits
+
+From sane-backends (`get_GHS_*`) and ScanSnap Home (re-notes); **observed** on
+the iX1300 where marked:
+
+| Byte | Bit | Meaning | Observed |
+|---|---|---|---|
+| 3 | 7 | U-turn hopper empty | yes |
+| 3 | 0 | front Return Scan slot loaded | yes |
+| 3 | 5 | ADF/cover open | - (closing the chute powers the unit off) |
+| 4 | 0 | Scan button pressed; latched, cleared by the next C2 read | yes: one 100 ms sample per press |
+| 4 | 5 | Scan button long press | **no**: a 3 s hold also sets only bit 0 |
+| 4 | 7 | sleep | yes |
+| 14 | 6 / 3 | scan end / scan cancel (48-byte form) | - |
+
+Idle, nothing loaded, asleep: `00 00 00 80 80 00 …`.
+
+The button raises no event on the USB side (two bulk pipes, no interrupt
+pipe) and PFU's USD reports none either; `src/button.c` polls byte 4 every
+200 ms, as ScanSnap Home's monitor does.
 
 ## 4. Generation behaviour (iX1300 == iX1600 profile)
 
@@ -127,6 +163,15 @@ Consequences:
   1 = ink, MSB first, whole-byte rows
 - a batch that fed a sheet is closed with `SCANNER CONTROL cancel` when the
   feeder runs empty; the `03/80/03` sense *is* the normal end of batch
+- duplex sides are read **alternately**, one block each: the unit buffers both
+  and answers `03/80/13` on the side read too far ahead. A side ends once a
+  READ has reported EOM and that side's last READ was short (ILI). This is
+  SANE's `DUPLEX_INTERLACE_ALT`, its default for every ScanSnap.
+- the pixel-size READ returns the **window** length (4200 lines for a 14"
+  window at 300 dpi); the real sheet ends earlier with EOM + ILI, the
+  information field holding the residue of the requested length
+- both sides arrive rotated 180 degrees for a sheet loaded as the manual says
+  (observed through NAPS2, front and back, not mirrored)
 
 ## 5. Established on hardware
 
@@ -142,7 +187,14 @@ Read from the attached unit (`04c5:162c`, `usbscan.sys`):
   own; the hardcoded 150-1200 dpi fallback list is wrong for it and is only
   used if VPD fails entirely.
 - **Colour interleaving**: `SET WINDOW` with order `0` (RGB dot) is accepted.
-- **Pixel size** after `SCAN` at 300 dpi: 2550x3300 for Letter.
+- **Pixel size** after `SCAN` at 300 dpi: 2550x4200 for a 14" window; a
+  Letter sheet then ends after 3315 lines with EOM + ILI.
+- **A full simplex page** (`build\simplex.log`): 97 READs of 260100 bytes
+  (34 lines each) with no `03/80/13`, the last one `eom 1 ili 1`, then the
+  next feed answers `03/80/03`. Colour, gray, line art and 600 dpi also
+  completed through NAPS2.
+- **Duplex READs** (`build\duplex.log`): `03/80/13` on roughly half of all
+  READs on both sides, each still carrying a full data phase.
 - **`0x2e/0x2f` is not the duplex field.** The unit is a duplex scanner (two
   CIS, 60 ipm) but the value there reads 0, so the iX1600 model is wrong at
   that offset. Nothing depends on it: `CAP_DUPLEX` is answered
@@ -153,7 +205,6 @@ Read from the attached unit (`04c5:162c`, `usbscan.sys`):
 
 ## 6. Not established on hardware
 
-- A complete scan: feed, SCAN, image READ, duplex, end-of-batch. The unit
-  wedged in firmware after an interrupted scan (see VERIFICATION.md section 5),
-  so this needs a power cycle and `probe.exe scan out`.
-- Straight-path / return-scan mode: only the U-turn ADF path is driven.
+- A side ending early (EOM + ILI) in the alternating **duplex** read loop:
+  NAPS2's Letter window ended every side on a full buffer. The simplex case
+  has run on the unit (`probe scan`, 3308-3320 lines of a 4200-line window).

@@ -23,6 +23,8 @@ cl /nologo /W3 /O2 /MT %DEFS% %INC% ..\..\tools\twaintest.c /Fe..\twaintest.exe 
 
 cl /nologo /W3 /O2 /MT %DEFS% %INC% ..\..\tools\dsmtest.c /Fe..\dsmtest.exe /link user32.lib || (popd & exit /b 1)
 
+cl /nologo /W3 /O2 /MT %DEFS% %INC% ..\..\src\button.c ..\..\src\proto.c ..\..\src\usb.c ..\..\src\misc.c /Fe..\ScanSnapButton.exe /link /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup winusb.lib setupapi.lib user32.lib advapi32.lib shell32.lib || (popd & exit /b 1)
+
 popd
 
 rem Test tools read ScanSnapTWAIN.ini from their own directory, so builds are
@@ -34,4 +36,5 @@ rem Mock in code because it is the hardware tool.
 
 echo.
 echo Built build\ScanSnap-iX1300.ds, build\probe.exe, build\selftest.exe,
-echo       build\mockscan.exe, build\twaintest.exe, build\dsmtest.exe
+echo       build\mockscan.exe, build\twaintest.exe, build\dsmtest.exe,
+echo       build\ScanSnapButton.exe

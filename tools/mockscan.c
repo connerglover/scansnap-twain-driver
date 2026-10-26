@@ -40,6 +40,40 @@ static ScanJob job_for(int composition, int res, int duplex)
     return j;
 }
 
+/*
+ * Mismatching bytes between a delivered page and the synthetic device's wire
+ * pattern for that side, after inversion and the 180-degree turn. Catches
+ * filler counted as image (the duplex gray bands), sides swapped or mixed,
+ * rows out of order, and a missing or doubled rotation.
+ */
+static size_t page_mismatches(const Page *pg, int side, int composition)
+{
+    DWORD bpl = (DWORD)pg->rowBytes;
+    LONG W = pg->width, H = pg->height, y, x;
+    size_t bad = 0;
+
+    for (y = 0; y < H; y++) {
+        const BYTE *row = pg->rows + pg->rowBytes * (size_t)y;
+        DWORD line = (DWORD)(H - 1 - y);
+        if (composition == COMP_LINEART) {
+            for (x = 0; x < W; x++) {
+                LONG from = W - 1 - x;
+                BYTE wire = mock_pattern(side, line, (DWORD)from >> 3, bpl);
+                int ink = (wire >> (7 - (from & 7))) & 1;
+                int got = (row[x >> 3] >> (7 - (x & 7))) & 1;
+                if (got != !ink) bad++;              /* TWAIN: 0 = black */
+            }
+        } else {
+            DWORD px = composition == COMP_COLOR ? 3 : 1, off;
+            for (off = 0; off < bpl; off++) {
+                DWORD from = ((DWORD)W - 1 - off / px) * px + off % px;
+                if (row[off] != (BYTE)~mock_pattern(side, line, from, bpl)) bad++;
+            }
+        }
+    }
+    return bad;
+}
+
 static int run_case(const char *label, int composition, int res, int duplex,
                     const char *outdir)
 {
@@ -47,6 +81,7 @@ static int run_case(const char *label, int composition, int res, int duplex,
     ScanJob j = job_for(composition, res, duplex);
     Page page;
     int back = 0, pages = 0, rc;
+    LONG lines = (LONG)((long long)j.lengthUnits * res / 1200);
 
     printf("%s\n", label);
     s = session_create();
@@ -56,6 +91,7 @@ static int run_case(const char *label, int composition, int res, int duplex,
 
     memset(&page, 0, sizeof page);
     for (;;) {
+        size_t bad;
         rc = session_next_page(s, &page, &back);
         if (rc != PROTO_OK) break;
         if (pages == 0) {
@@ -66,6 +102,11 @@ static int run_case(const char *label, int composition, int res, int duplex,
                                     : composition == COMP_LINEART ? TWPT_BW : TWPT_GRAY),
                   "pixel type %d", page.pixelType);
         }
+        /* the unit reports a longer window and ends the sheet with EOM/ILI */
+        CHECK(page.height == lines, "page %d height %ld (sheet %ld lines)", pages, page.height, lines);
+        CHECK(back == (duplex ? pages % 2 : 0), "page %d side %d", pages, back);
+        bad = page_mismatches(&page, back, composition);
+        CHECK(bad == 0, "page %d pixels match the %s side (%zu bad)", pages, back ? "back" : "front", bad);
         if (outdir) {
             char name[MAX_PATH];
             sprintf_s(name, sizeof name, "%s\\%s-%d.bmp", outdir, label, pages);
